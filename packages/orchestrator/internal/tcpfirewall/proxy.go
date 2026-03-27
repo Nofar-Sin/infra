@@ -26,15 +26,13 @@ type Proxy struct {
 	limiter      *connlimit.ConnectionLimiter
 	featureFlags *featureflags.Client
 
-	// Separate ports for different traffic types to avoid protocol detection blocking
-	// on server-first protocols like SSH.
-	httpPort  uint16 // For port 80 traffic - HTTP Host header inspection
-	tlsPort   uint16 // For port 443 traffic - TLS SNI inspection
-	otherPort uint16 // For all other ports - CIDR-only, no protocol inspection
+	// Separate ports to avoid protocol detection blocking on server-first protocols.
+	httpPort  uint16
+	tlsPort   uint16
+	otherPort uint16
 
-	socks5Dialers socks5DialerCache
-
-	proxy *tcpproxy.Proxy
+	proxy    *tcpproxy.Proxy
+	udpProxy *UDPProxy
 }
 
 func New(logger logger.Logger, networkConfig network.Config, sandboxes *sandbox.Map, meterProvider metric.MeterProvider, featureFlags *featureflags.Client) *Proxy {
@@ -47,6 +45,7 @@ func New(logger logger.Logger, networkConfig network.Config, sandboxes *sandbox.
 		metrics:      NewMetrics(meterProvider),
 		limiter:      connlimit.NewConnectionLimiter(),
 		featureFlags: featureFlags,
+		udpProxy:     NewUDPProxy(logger, sandboxes, featureFlags, networkConfig.SandboxEgressProxyUDPPort),
 	}
 
 	sandboxes.Subscribe(p)
@@ -58,6 +57,7 @@ func (p *Proxy) OnInsert(_ *sandbox.Sandbox) {}
 
 func (p *Proxy) OnRemove(sandboxID string) {
 	p.limiter.Remove(sandboxID)
+	p.udpProxy.RemoveSandbox(sandboxID)
 }
 
 func (p *Proxy) Start(ctx context.Context) error {
@@ -86,22 +86,22 @@ func (p *Proxy) Start(ctx context.Context) error {
 	tlsAddr := fmt.Sprintf("0.0.0.0:%d", p.tlsPort)
 	otherAddr := fmt.Sprintf("0.0.0.0:%d", p.otherPort)
 
-	// HTTP listener (port 80 traffic): inspect Host header for domain allowlist
 	p.proxy.AddHTTPHostMatchRoute(httpAddr, func(_ context.Context, _ string) bool { return true }, p.newConnectionHandler(ctx, domainHandler, ProtocolHTTP))
 	p.proxy.AddRoute(httpAddr, p.newConnectionHandler(ctx, cidrOnlyHandler, ProtocolHTTP))
 
-	// TLS listener (port 443 traffic): inspect SNI for domain allowlist
 	p.proxy.AddSNIMatchRoute(tlsAddr, func(_ context.Context, _ string) bool { return true }, p.newConnectionHandler(ctx, domainHandler, ProtocolTLS))
 	p.proxy.AddRoute(tlsAddr, p.newConnectionHandler(ctx, cidrOnlyHandler, ProtocolTLS))
 
-	// Other listener (all other ports): CIDR-only check, no protocol inspection
-	// This prevents blocking on server-first protocols like SSH
 	p.proxy.AddRoute(otherAddr, p.newConnectionHandler(ctx, cidrOnlyHandler, ProtocolOther))
 
 	p.logger.Info(ctx, "TCP firewall proxy started",
 		zap.Uint16("http_port", p.httpPort),
 		zap.Uint16("tls_port", p.tlsPort),
 		zap.Uint16("other_port", p.otherPort))
+
+	if err := p.udpProxy.Start(ctx); err != nil {
+		return fmt.Errorf("start UDP egress proxy: %w", err)
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -118,6 +118,8 @@ func (p *Proxy) Start(ctx context.Context) error {
 }
 
 func (p *Proxy) Close(_ context.Context) error {
+	p.udpProxy.Close()
+
 	if p.proxy != nil {
 		return p.proxy.Close()
 	}
@@ -125,48 +127,41 @@ func (p *Proxy) Close(_ context.Context) error {
 	return nil
 }
 
-// handlerFunc is the signature for connection handlers.
 type handlerFunc func(ctx context.Context, conn net.Conn, dstIP net.IP, dstPort int, sbx *sandbox.Sandbox, logger logger.Logger, metrics *Metrics, protocol Protocol)
 
 var _ tcpproxy.Target = (*connectionHandler)(nil)
 
-// connectionHandler adapts a handler function to tcpproxy.Target interface.
 type connectionHandler struct {
 	ctx context.Context //nolint:containedctx // base context for request tracing
 
-	handler       handlerFunc
-	protocol      Protocol
-	metrics       *Metrics
-	limiter       *connlimit.ConnectionLimiter
-	logger        logger.Logger
-	sandboxes     *sandbox.Map
-	featureFlags  *featureflags.Client
-	socks5Dialers *socks5DialerCache // stable egress IP proxy cache
+	handler      handlerFunc
+	protocol     Protocol
+	metrics      *Metrics
+	limiter      *connlimit.ConnectionLimiter
+	logger       logger.Logger
+	sandboxes    *sandbox.Map
+	featureFlags *featureflags.Client
 }
 
 func (p *Proxy) newConnectionHandler(ctx context.Context, handler handlerFunc, protocol Protocol) *connectionHandler {
 	return &connectionHandler{
-		ctx:           ctx,
-		handler:       handler,
-		protocol:      protocol,
-		metrics:       p.metrics,
-		limiter:       p.limiter,
-		logger:        p.logger,
-		sandboxes:     p.sandboxes,
-		featureFlags:  p.featureFlags,
-		socks5Dialers: &p.socks5Dialers,
+		ctx:          ctx,
+		handler:      handler,
+		protocol:     protocol,
+		metrics:      p.metrics,
+		limiter:      p.limiter,
+		logger:       p.logger,
+		sandboxes:    p.sandboxes,
+		featureFlags: p.featureFlags,
 	}
 }
 
 func (t *connectionHandler) HandleConn(conn net.Conn) {
-	// Request tracing context.
 	ctx := t.ctx
 
-	// Get the underlying connection for sandbox lookup and original dst.
 	// tcpproxy may wrap in *tcpproxy.Conn for peeked bytes.
 	rawConn := tcpproxy.UnderlyingConn(conn)
 
-	// Look up sandbox by source address
 	sourceAddr := rawConn.RemoteAddr().String()
 	sbx, err := t.sandboxes.GetByHostPort(sourceAddr)
 	if err != nil {
@@ -183,7 +178,6 @@ func (t *connectionHandler) HandleConn(conn net.Conn) {
 	sandboxID := sbx.Runtime.SandboxID
 	sbxLogger := t.logger.With(logger.WithSandboxID(sandboxID))
 
-	// Check per-sandbox connection limit
 	maxLimit := t.featureFlags.IntFlag(ctx, featureflags.TCPFirewallMaxConnectionsPerSandbox)
 	count, acquired := t.limiter.TryAcquire(sandboxID, maxLimit)
 	if !acquired {
@@ -193,7 +187,6 @@ func (t *connectionHandler) HandleConn(conn net.Conn) {
 		return
 	}
 
-	// Get original destination (before iptables redirect)
 	ip, port, err := getOriginalDst(rawConn)
 	if err != nil {
 		sbxLogger.Error(ctx, "failed to get original destination", zap.Error(err))
@@ -205,22 +198,29 @@ func (t *connectionHandler) HandleConn(conn net.Conn) {
 	}
 
 	t.metrics.RecordConnectionsPerSandbox(ctx, count)
-	t.metrics.RecordConnection(ctx, t.protocol)
 
 	proxyAddr := t.featureFlags.StringFlag(ctx, featureflags.SandboxEgressProxy,
 		featureflags.TeamContext(sbx.Runtime.TeamID))
+	t.metrics.RecordConnection(ctx, t.protocol, proxyAddr != "")
+
 	if proxyAddr != "" {
-		dialCtx, dialErr := t.socks5Dialers.Get(proxyAddr)
+		auth := socks5AuthFromRuntime(sbx.Runtime)
+
+		dialFn, dialErr := newSOCKS5DialContext(proxyAddr, auth)
 		if dialErr != nil {
-			sbxLogger.Error(ctx, "failed to create SOCKS5 dialer for egress proxy",
+			sbxLogger.Error(ctx, "failed to create SOCKS5 dialer for egress proxy, blocking connection",
 				zap.String("proxy_addr", proxyAddr),
 				zap.Error(dialErr))
-		} else {
-			ctx = withSOCKS5DialContext(ctx, dialCtx)
+			t.metrics.RecordError(ctx, ErrorTypeSOCKS5Dial, t.protocol)
+			t.limiter.Release(sandboxID)
+			conn.Close()
+
+			return
 		}
+
+		ctx = withSOCKS5DialContext(ctx, dialFn)
 	}
 
-	// Wrap the handler to release the connection slot when done
 	wrappedHandler := func(ctx context.Context, conn net.Conn, dstIP net.IP, dstPort int, sbx *sandbox.Sandbox, l logger.Logger, metrics *Metrics, protocol Protocol) {
 		defer t.limiter.Release(sandboxID)
 		t.handler(ctx, conn, dstIP, dstPort, sbx, l, metrics, protocol)

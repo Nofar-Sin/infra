@@ -116,6 +116,10 @@ func proxy(ctx context.Context, conn net.Conn, upstreamAddr string, metrics *Met
 // is not internal/private BEFORE connecting. This prevents DNS rebinding attacks while
 // preserving multi-IP reliability.
 //
+// When a SOCKS5 proxy is configured, DNS resolution happens on the SOCKS5 proxy side,
+// so we perform a local pre-resolution check and then delegate to the SOCKS5 dialer.
+// The SOCKS5 proxy itself is trusted (network-isolated in a dedicated VPC).
+//
 // The ControlContext callback is called after DNS resolution but before the TCP connect()
 // syscall, so no TCP handshake occurs to internal IPs.
 func proxyWithIPVerification(ctx context.Context, conn net.Conn, upstreamAddr string, logger logger.Logger, metrics *Metrics, protocol Protocol) {
@@ -127,15 +131,32 @@ func proxyWithIPVerification(ctx context.Context, conn net.Conn, upstreamAddr st
 		DialTimeout: upstreamDialTimeout,
 	}
 
-	if dialCtx := socks5DialContextFromCtx(ctx); dialCtx != nil {
-		dp.DialContext = dialCtx
+	if socks5Dial := socks5DialContextFromCtx(ctx); socks5Dial != nil {
+		// With SOCKS5, DNS resolution ultimately happens at the proxy, but we do a
+		// best-effort local resolution check first to catch obvious rebinding attempts.
+		dp.DialContext = func(dialCtx context.Context, network, addr string) (net.Conn, error) {
+			host, _, err := net.SplitHostPort(addr)
+			if err == nil {
+				if ips, resolveErr := net.DefaultResolver.LookupHost(dialCtx, host); resolveErr == nil {
+					for _, ipStr := range ips {
+						if ip := net.ParseIP(ipStr); ip != nil && isIPInAlwaysDeniedCIDRs(ip) {
+							logger.Warn(ctx, "Blocked connection to internal IP via hostname (pre-SOCKS5 check)",
+								zap.String("upstream_addr", addr),
+								zap.String("resolved_ip", ipStr))
+							metrics.RecordError(ctx, ErrorTypeResolvedIPBlocked, protocol)
+
+							return nil, fmt.Errorf("hostname resolved to internal IP %s", ipStr)
+						}
+					}
+				}
+			}
+
+			return socks5Dial(dialCtx, network, addr)
+		}
 	} else {
 		dp.DialContext = func(dialCtx context.Context, network, addr string) (net.Conn, error) {
 			dialer := &net.Dialer{
 				Timeout: upstreamDialTimeout,
-				// ControlContext is called after DNS resolution but BEFORE the TCP connect() syscall.
-				// The 'address' parameter contains the resolved IP:port, allowing us to block
-				// connections to internal IPs before any TCP handshake occurs.
 				ControlContext: func(_ context.Context, _, address string, _ syscall.RawConn) error {
 					host, _, err := net.SplitHostPort(address)
 					if err != nil {

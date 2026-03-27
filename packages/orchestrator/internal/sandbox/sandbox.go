@@ -163,6 +163,11 @@ type RuntimeMetadata struct {
 	// BuildID is the ID of the associated template build.
 	BuildID     string
 	SandboxType SandboxType
+
+	// SOCKS5 egress proxy auth. See socks5AuthFromRuntime for precedence.
+	EgressProxyToken    string // token mode: sandboxID as user, token as password
+	EgressProxyUser     string // overrides username; supports {{sandboxID}} placeholder
+	EgressProxyPassword string
 }
 
 type Resources struct {
@@ -380,10 +385,9 @@ func (f *Factory) CreateSandbox(
 		return nil, err
 	}
 
-	// Enable non-TCP egress NAT for teams with a stable egress proxy configured.
 	if proxyAddr := f.featureFlags.StringFlag(ctx, featureflags.SandboxEgressProxy, featureflags.TeamContext(runtime.TeamID)); proxyAddr != "" {
-		if err := ips.EnableEgressNAT(); err != nil {
-			return nil, fmt.Errorf("failed to enable egress NAT: %w", err)
+		if err := ips.EnableEgressProxy(); err != nil {
+			return nil, fmt.Errorf("failed to enable egress proxy: %w", err)
 		}
 	}
 
@@ -668,8 +672,8 @@ func (f *Factory) ResumeSandbox(
 	telemetry.ReportEvent(ctx, "got network slot")
 
 	if proxyAddr := f.featureFlags.StringFlag(ctx, featureflags.SandboxEgressProxy, featureflags.TeamContext(runtime.TeamID)); proxyAddr != "" {
-		if err := ips.EnableEgressNAT(); err != nil {
-			return nil, fmt.Errorf("failed to enable egress NAT: %w", err)
+		if err := ips.EnableEgressProxy(); err != nil {
+			return nil, fmt.Errorf("failed to enable egress proxy: %w", err)
 		}
 	}
 

@@ -10,7 +10,6 @@ import (
 	"github.com/google/nftables/expr"
 	"github.com/ngrok/firewall_toolkit/pkg/expressions"
 	"github.com/ngrok/firewall_toolkit/pkg/set"
-	"golang.org/x/sys/unix"
 
 	sandbox_network "github.com/e2b-dev/infra/packages/shared/pkg/sandbox-network"
 )
@@ -148,36 +147,6 @@ func (fw *Firewall) addSetFilterRule(ipSet *nftables.Set, drop bool) {
 	})
 }
 
-// addNonTCPSetFilterRule adds a filter rule that matches ONLY non-TCP traffic to destinations in a set.
-// If drop is true, packets are dropped. Otherwise, they are accepted.
-// TCP traffic is NOT affected by this rule (iptables REDIRECT handles TCP traffic).
-func (fw *Firewall) addNonTCPSetFilterRule(ipSet *nftables.Set, drop bool) {
-	var verdict []expr.Any
-	if drop {
-		verdict = []expr.Any{&expr.Verdict{Kind: expr.VerdictDrop}}
-	} else {
-		verdict = accept()
-	}
-
-	fw.conn.AddRule(&nftables.Rule{
-		Table: fw.table,
-		Chain: fw.filterChain,
-		Exprs: append(append(fw.tapIfaceMatch(),
-			// Match non-TCP protocol (protocol != TCP)
-			&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
-			&expr.Cmp{
-				Op:       expr.CmpOpNeq,
-				Register: 1,
-				Data:     []byte{unix.IPPROTO_TCP},
-			},
-			// Check dest in set
-			expressions.IPv4DestinationAddress(1),
-			expressions.IPSetLookUp(ipSet, 1)),
-			verdict...,
-		),
-	})
-}
-
 func (fw *Firewall) installRules() error {
 	// ============================================================
 	// FILTER CHAIN (PREROUTING, priority -150)
@@ -185,21 +154,19 @@ func (fw *Firewall) installRules() error {
 	//   1. ESTABLISHED/RELATED → accept (allow responses even from denied ranges)
 	//   2. predefinedAllowSet → accept (all protocols)
 	//   3. predefinedDenySet → DROP (all protocols, hard block)
-	//   4. Non-TCP: userAllowSet → accept
-	//   5. Non-TCP: userDenySet → DROP
-	//   6. Default: ACCEPT (TCP handled by iptables REDIRECT)
+	//   4. userAllowSet → accept (all protocols)
+	//   5. userDenySet → DROP (all protocols)
+	//   6. Default: ACCEPT
 	//
+	// This runs before iptables REDIRECT (priority -100), so traffic
+	// blocked here never reaches the TCP/UDP egress proxy.
 	// ============================================================
 
-	// Rule 1: Allow ESTABLISHED/RELATED connections - all protocols
-	// This ensures response packets are allowed even if the source is in predefinedDenySet
 	fw.conn.AddRule(&nftables.Rule{
 		Table: fw.table,
 		Chain: fw.filterChain,
 		Exprs: append(append(fw.tapIfaceMatch(),
-			// Load CT state
 			&expr.Ct{Key: expr.CtKeySTATE, Register: 1},
-			// Check ESTABLISHED or RELATED
 			&expr.Bitwise{
 				SourceRegister: 1,
 				DestRegister:   1,
@@ -216,23 +183,10 @@ func (fw *Firewall) installRules() error {
 		),
 	})
 
-	// Rule 2: predefinedAllowSet → accept (all protocols)
 	fw.addSetFilterRule(fw.predefinedAllowSet.Set(), false)
-
-	// Rule 3: predefinedDenySet → DROP (all protocols, hard block)
 	fw.addSetFilterRule(fw.predefinedDenySet.Set(), true)
-
-	// Rule 4: Non-TCP + userAllowSet → accept
-	// Only non-TCP traffic is affected; TCP goes to proxy
-	fw.addNonTCPSetFilterRule(fw.userAllowSet.Set(), false)
-
-	// Rule 5: Non-TCP + userDenySet → DROP
-	// Only non-TCP traffic is affected; TCP goes to proxy
-	fw.addNonTCPSetFilterRule(fw.userDenySet.Set(), true)
-
-	// Default policy: ACCEPT
-	// - Non-TCP not in user sets: allowed (default policy)
-	// - TCP: iptables REDIRECT handles TCP traffic to proxy
+	fw.addSetFilterRule(fw.userAllowSet.Set(), false)
+	fw.addSetFilterRule(fw.userDenySet.Set(), true)
 
 	if err := fw.conn.Flush(); err != nil {
 		return fmt.Errorf("flush nftables changes: %w", err)

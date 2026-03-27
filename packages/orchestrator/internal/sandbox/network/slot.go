@@ -63,8 +63,8 @@ type Slot struct {
 
 	Firewall *Firewall
 
-	firewallCustomRules atomic.Bool
-	egressNATEnabled    atomic.Bool
+	firewallCustomRules  atomic.Bool
+	egressProxyEnabled   atomic.Bool
 
 	vPeerIp net.IP
 	vEthIp  net.IP
@@ -85,6 +85,8 @@ type Slot struct {
 	tcpFirewallHTTPPort  string // Port 80 traffic
 	tcpFirewallTLSPort   string // Port 443 traffic
 	tcpFirewallOtherPort string // All other traffic
+
+	egressProxyUDPPort string
 
 	config Config
 }
@@ -147,6 +149,8 @@ func NewSlot(key string, idx int, config Config) (*Slot, error) {
 		tcpFirewallHTTPPort:  strconv.FormatUint(uint64(config.SandboxTCPFirewallHTTPPort), 10),
 		tcpFirewallTLSPort:   strconv.FormatUint(uint64(config.SandboxTCPFirewallTLSPort), 10),
 		tcpFirewallOtherPort: strconv.FormatUint(uint64(config.SandboxTCPFirewallOtherPort), 10),
+
+		egressProxyUDPPort: strconv.FormatUint(uint64(config.SandboxEgressProxyUDPPort), 10),
 
 		config: config,
 	}
@@ -321,7 +325,7 @@ func (s *Slot) ResetInternet(ctx context.Context) error {
 
 	var errs []error
 
-	if err := s.DisableEgressNAT(); err != nil {
+	if err := s.DisableEgressProxy(); err != nil {
 		errs = append(errs, err)
 	}
 
@@ -343,43 +347,28 @@ func (s *Slot) ResetInternet(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-const egressNATMark = "0x100"
-
-// EnableEgressNAT marks non-TCP traffic from this slot's veth for policy routing
-// through the egress NAT tunnel interface. Requires EGRESS_NAT_INTERFACE and
-// corresponding ip rule/route to be set up on the host.
-func (s *Slot) EnableEgressNAT() error {
-	if s.config.EgressNATInterface == "" {
-		return nil
-	}
-
+// EnableEgressProxy adds a UDP iptables REDIRECT to the egress proxy port.
+// TCP redirect already exists for all sandboxes; this is opt-in for UDP.
+func (s *Slot) EnableEgressProxy() error {
 	tables, err := iptables.New()
 	if err != nil {
 		return fmt.Errorf("error initializing iptables: %w", err)
 	}
 
-	// Mark non-TCP forwarded packets from this sandbox for policy routing
-	if err := tables.Append("mangle", "FORWARD", "-i", s.VethName(), "!", "-p", "tcp", "-j", "MARK", "--set-mark", egressNATMark); err != nil {
-		return fmt.Errorf("error adding egress NAT mark rule: %w", err)
+	if err := tables.Append("nat", "PREROUTING",
+		"-i", s.VethName(), "-p", "udp",
+		"-j", "REDIRECT", "--to-port", s.egressProxyUDPPort,
+	); err != nil {
+		return fmt.Errorf("error adding egress proxy UDP redirect rule: %w", err)
 	}
 
-	// Allow forwarding to/from the tunnel interface
-	iface := s.config.EgressNATInterface
-	if err := tables.Append("filter", "FORWARD", "-i", s.VethName(), "-o", iface, "-j", "ACCEPT"); err != nil {
-		return fmt.Errorf("error adding egress NAT forward rule: %w", err)
-	}
-
-	if err := tables.Append("filter", "FORWARD", "-i", iface, "-o", s.VethName(), "-j", "ACCEPT"); err != nil {
-		return fmt.Errorf("error adding egress NAT return forward rule: %w", err)
-	}
-
-	s.egressNATEnabled.Store(true)
+	s.egressProxyEnabled.Store(true)
 
 	return nil
 }
 
-func (s *Slot) DisableEgressNAT() error {
-	if !s.egressNATEnabled.CompareAndSwap(true, false) {
+func (s *Slot) DisableEgressProxy() error {
+	if !s.egressProxyEnabled.CompareAndSwap(true, false) {
 		return nil
 	}
 
@@ -388,22 +377,14 @@ func (s *Slot) DisableEgressNAT() error {
 		return fmt.Errorf("error initializing iptables: %w", err)
 	}
 
-	var errs []error
-
-	if err := tables.Delete("mangle", "FORWARD", "-i", s.VethName(), "!", "-p", "tcp", "-j", "MARK", "--set-mark", egressNATMark); err != nil {
-		errs = append(errs, fmt.Errorf("error deleting egress NAT mark rule: %w", err))
+	if err := tables.Delete("nat", "PREROUTING",
+		"-i", s.VethName(), "-p", "udp",
+		"-j", "REDIRECT", "--to-port", s.egressProxyUDPPort,
+	); err != nil {
+		return fmt.Errorf("error deleting egress proxy UDP redirect rule: %w", err)
 	}
 
-	iface := s.config.EgressNATInterface
-	if err := tables.Delete("filter", "FORWARD", "-i", s.VethName(), "-o", iface, "-j", "ACCEPT"); err != nil {
-		errs = append(errs, fmt.Errorf("error deleting egress NAT forward rule: %w", err))
-	}
-
-	if err := tables.Delete("filter", "FORWARD", "-i", iface, "-o", s.VethName(), "-j", "ACCEPT"); err != nil {
-		errs = append(errs, fmt.Errorf("error deleting egress NAT return forward rule: %w", err))
-	}
-
-	return errors.Join(errs...)
+	return nil
 }
 
 func getHostNetworkCIDR() *net.IPNet {

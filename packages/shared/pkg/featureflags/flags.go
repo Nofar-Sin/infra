@@ -231,7 +231,7 @@ var FirecrackerVersionMap = map[string]string{
 	"v1.12": DefaultFirecackerV1_12Version,
 }
 
-// SandboxEgressProxy per-team SOCKS5 proxy address (host:port) for stable egress IP. Empty = direct.
+// SandboxEgressProxy per-team SOCKS5 proxy address (host:port) for transparent egress proxying. Empty = direct.
 var SandboxEgressProxy = newStringFlag("sandbox-egress-proxy", "")
 
 // BuildIoEngine Sync is used by default as there seems to be a bad interaction between Async and a lot of io operations.

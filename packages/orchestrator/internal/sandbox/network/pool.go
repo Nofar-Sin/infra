@@ -28,7 +28,7 @@ var (
 
 	newSlotsAvailableCounter = utils.Must(meter.Int64UpDownCounter("orchestrator.network.slots_pool.new",
 		metric.WithDescription("Number of new network slots ready to be used."),
-		metric.WithUnit("{slot"),
+		metric.WithUnit("{slot}"),
 	))
 	reusableSlotsAvailableCounter = utils.Must(meter.Int64UpDownCounter("orchestrator.network.slots_pool.reused",
 		metric.WithDescription("Number of reused network slots ready to be used."),
@@ -49,7 +49,7 @@ var (
 )
 
 type Config struct {
-	// Using reserver IPv4 in range that is used for experiments and documentation
+	// Using reserved IPv4 in range that is used for experiments and documentation
 	// https://en.wikipedia.org/wiki/Reserved_IP_addresses
 	OrchestratorInSandboxIPAddress string `env:"SANDBOX_ORCHESTRATOR_IP" envDefault:"192.0.2.1"`
 
@@ -68,10 +68,7 @@ type Config struct {
 	SandboxTCPFirewallTLSPort   uint16 `env:"SANDBOX_TCP_FIREWALL_TLS_PORT"   envDefault:"5017"`
 	SandboxTCPFirewallOtherPort uint16 `env:"SANDBOX_TCP_FIREWALL_OTHER_PORT" envDefault:"5018"`
 
-	// EgressNATInterface is the tunnel interface for routing non-TCP stable egress traffic.
-	// When set (e.g. "egress-tun"), non-TCP packets from sandboxes with stable egress
-	// are marked and policy-routed through this interface. Empty = disabled.
-	EgressNATInterface string `env:"EGRESS_NAT_INTERFACE" envDefault:""`
+	SandboxEgressProxyUDPPort uint16 `env:"SANDBOX_EGRESS_PROXY_UDP_PORT" envDefault:"5019"`
 }
 
 func ParseConfig() (Config, error) {

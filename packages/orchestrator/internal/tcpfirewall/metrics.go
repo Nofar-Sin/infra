@@ -45,10 +45,9 @@ const (
 	ErrorTypeOrigDst           ErrorType = "original_dst"
 	ErrorTypeSandboxLookup     ErrorType = "sandbox_lookup"
 	ErrorTypeEgressCheck       ErrorType = "egress_check"
-	ErrorTypeUpstreamDial      ErrorType = "upstream_dial"
-	ErrorTypeConnectionMeta    ErrorType = "connection_meta"
 	ErrorTypeResolvedIPBlocked ErrorType = "resolved_ip_blocked"
 	ErrorTypeLimitExceeded     ErrorType = "limit_exceeded"
+	ErrorTypeSOCKS5Dial        ErrorType = "socks5_dial"
 )
 
 // Metrics holds all TCP firewall metrics.
@@ -89,9 +88,10 @@ func NewMetrics(meterProvider metric.MeterProvider) *Metrics {
 }
 
 // RecordConnection records a new connection being processed.
-func (m *Metrics) RecordConnection(ctx context.Context, protocol Protocol) {
+func (m *Metrics) RecordConnection(ctx context.Context, protocol Protocol, proxied bool) {
 	m.connectionsTotal.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("protocol", string(protocol)),
+		attribute.Bool("proxied", proxied),
 	))
 }
 

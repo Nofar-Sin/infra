@@ -4,15 +4,51 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"sync"
+	"strings"
 
 	xproxy "golang.org/x/net/proxy"
+
+	"github.com/e2b-dev/infra/packages/orchestrator/internal/sandbox"
 )
 
 type DialContextFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
-func newSOCKS5DialContext(proxyAddr string) (DialContextFunc, error) {
-	dialer, err := xproxy.SOCKS5("tcp", proxyAddr, nil, xproxy.Direct)
+const sandboxIDPlaceholder = "{{sandboxID}}"
+
+// socks5AuthFromRuntime derives SOCKS5 credentials from sandbox runtime metadata.
+//
+// Precedence:
+//  1. EgressProxyUser set → customer-provided credentials. The username may
+//     contain the placeholder {{sandboxID}} which is replaced with the actual
+//     sandbox ID (useful for residential IP providers that encode session info
+//     in the username, e.g. "customer-user-session_{{sandboxID}}").
+//  2. EgressProxyToken set → E2B identity: sandboxID as user, token as password.
+//  3. Neither → nil (no auth).
+func socks5AuthFromRuntime(rt sandbox.RuntimeMetadata) *xproxy.Auth {
+	switch {
+	case rt.EgressProxyUser != "":
+		user := strings.ReplaceAll(rt.EgressProxyUser, sandboxIDPlaceholder, rt.SandboxID)
+
+		return &xproxy.Auth{
+			User:     user,
+			Password: rt.EgressProxyPassword,
+		}
+	case rt.EgressProxyToken != "":
+		return &xproxy.Auth{
+			User:     rt.SandboxID,
+			Password: rt.EgressProxyToken,
+		}
+	default:
+		return nil
+	}
+}
+
+// newSOCKS5DialContext creates a SOCKS5 dialer for the given proxy address and
+// optional auth. Creation is cheap (no I/O, just struct init), so we create a
+// fresh dialer per connection to support per-sandbox auth credentials without
+// needing a cache.
+func newSOCKS5DialContext(proxyAddr string, auth *xproxy.Auth) (DialContextFunc, error) {
+	dialer, err := xproxy.SOCKS5("tcp", proxyAddr, auth, xproxy.Direct)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create SOCKS5 dialer for %q: %w", proxyAddr, err)
 	}
@@ -23,42 +59,6 @@ func newSOCKS5DialContext(proxyAddr string) (DialContextFunc, error) {
 	}
 
 	return ctxDialer.DialContext, nil
-}
-
-type socks5DialerCache struct {
-	mu      sync.RWMutex
-	dialers map[string]DialContextFunc
-}
-
-func (c *socks5DialerCache) Get(addr string) (DialContextFunc, error) {
-	c.mu.RLock()
-	if fn, ok := c.dialers[addr]; ok {
-		c.mu.RUnlock()
-
-		return fn, nil
-	}
-	c.mu.RUnlock()
-
-	fn, err := newSOCKS5DialContext(addr)
-	if err != nil {
-		return nil, err
-	}
-
-	c.mu.Lock()
-	if c.dialers == nil {
-		c.dialers = make(map[string]DialContextFunc)
-	}
-
-	if existing, ok := c.dialers[addr]; ok {
-		c.mu.Unlock()
-
-		return existing, nil
-	}
-
-	c.dialers[addr] = fn
-	c.mu.Unlock()
-
-	return fn, nil
 }
 
 type socks5CtxKey struct{}
