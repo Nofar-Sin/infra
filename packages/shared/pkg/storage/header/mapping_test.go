@@ -18,7 +18,7 @@ var blockSize = uint64(2 << 20)
 
 var size = 8 * blockSize
 
-var simpleBase = []*BuildMap{
+var simpleBase = []BuildMap{
 	{
 		Offset:  0,
 		Length:  2 * blockSize,
@@ -38,7 +38,7 @@ var simpleBase = []*BuildMap{
 
 func TestMergeMappingsRemoveEmpty(t *testing.T) {
 	t.Parallel()
-	diff := []*BuildMap{
+	diff := []BuildMap{
 		{
 			Offset:  0,
 			Length:  0,
@@ -57,7 +57,7 @@ func TestMergeMappingsRemoveEmpty(t *testing.T) {
 
 func TestMergeMappingsBaseBeforeDiffNoOverlap(t *testing.T) {
 	t.Parallel()
-	diff := []*BuildMap{
+	diff := []BuildMap{
 		{
 			Offset:  7 * blockSize,
 			Length:  1 * blockSize,
@@ -67,7 +67,7 @@ func TestMergeMappingsBaseBeforeDiffNoOverlap(t *testing.T) {
 
 	m := MergeMappings(simpleBase, diff)
 
-	require.True(t, Equal(m, []*BuildMap{
+	require.True(t, Equal(m, []BuildMap{
 		{
 			Offset:  0,
 			Length:  2 * blockSize,
@@ -97,7 +97,7 @@ func TestMergeMappingsBaseBeforeDiffNoOverlap(t *testing.T) {
 
 func TestMergeMappingsDiffBeforeBaseNoOverlap(t *testing.T) {
 	t.Parallel()
-	diff := []*BuildMap{
+	diff := []BuildMap{
 		{
 			Offset:  0,
 			Length:  1 * blockSize,
@@ -107,7 +107,7 @@ func TestMergeMappingsDiffBeforeBaseNoOverlap(t *testing.T) {
 
 	m := MergeMappings(simpleBase, diff)
 
-	require.True(t, Equal(m, []*BuildMap{
+	require.True(t, Equal(m, []BuildMap{
 		{
 			Offset:  0,
 			Length:  1 * blockSize,
@@ -137,7 +137,7 @@ func TestMergeMappingsDiffBeforeBaseNoOverlap(t *testing.T) {
 
 func TestMergeMappingsBaseInsideDiff(t *testing.T) {
 	t.Parallel()
-	diff := []*BuildMap{
+	diff := []BuildMap{
 		{
 			Offset:  1 * blockSize,
 			Length:  5 * blockSize,
@@ -147,7 +147,7 @@ func TestMergeMappingsBaseInsideDiff(t *testing.T) {
 
 	m := MergeMappings(simpleBase, diff)
 
-	require.True(t, Equal(m, []*BuildMap{
+	require.True(t, Equal(m, []BuildMap{
 		{
 			Offset:  0,
 			Length:  1 * blockSize,
@@ -172,7 +172,7 @@ func TestMergeMappingsBaseInsideDiff(t *testing.T) {
 
 func TestMergeMappingsDiffInsideBase(t *testing.T) {
 	t.Parallel()
-	diff := []*BuildMap{
+	diff := []BuildMap{
 		{
 			Offset:  3 * blockSize,
 			Length:  1 * blockSize,
@@ -182,7 +182,7 @@ func TestMergeMappingsDiffInsideBase(t *testing.T) {
 
 	m := MergeMappings(simpleBase, diff)
 
-	require.True(t, Equal(m, []*BuildMap{
+	require.True(t, Equal(m, []BuildMap{
 		{
 			Offset:  0,
 			Length:  2 * blockSize,
@@ -217,7 +217,7 @@ func TestMergeMappingsDiffInsideBase(t *testing.T) {
 
 func TestMergeMappingsBaseAfterDiffWithOverlap(t *testing.T) {
 	t.Parallel()
-	diff := []*BuildMap{
+	diff := []BuildMap{
 		{
 			Offset:  1 * blockSize,
 			Length:  4 * blockSize,
@@ -227,7 +227,7 @@ func TestMergeMappingsBaseAfterDiffWithOverlap(t *testing.T) {
 
 	m := MergeMappings(simpleBase, diff)
 
-	require.True(t, Equal(m, []*BuildMap{
+	require.True(t, Equal(m, []BuildMap{
 		{
 			Offset:  0,
 			Length:  1 * blockSize,
@@ -257,7 +257,7 @@ func TestMergeMappingsBaseAfterDiffWithOverlap(t *testing.T) {
 
 func TestMergeMappingsDiffAfterBaseWithOverlap(t *testing.T) {
 	t.Parallel()
-	diff := []*BuildMap{
+	diff := []BuildMap{
 		{
 			Offset:  3 * blockSize,
 			Length:  4 * blockSize,
@@ -267,7 +267,7 @@ func TestMergeMappingsDiffAfterBaseWithOverlap(t *testing.T) {
 
 	m := MergeMappings(simpleBase, diff)
 
-	require.True(t, Equal(m, []*BuildMap{
+	require.True(t, Equal(m, []BuildMap{
 		{
 			Offset:  0,
 			Length:  2 * blockSize,
@@ -297,13 +297,13 @@ func TestMergeMappingsDiffAfterBaseWithOverlap(t *testing.T) {
 
 func TestNormalizeMappingsEmptySlice(t *testing.T) {
 	t.Parallel()
-	m := NormalizeMappings([]*BuildMap{})
+	m := NormalizeMappings(t.Context(),[]BuildMap{})
 	assert.Empty(t, m)
 }
 
 func TestNormalizeMappingsSingleMapping(t *testing.T) {
 	t.Parallel()
-	input := []*BuildMap{
+	input := []BuildMap{
 		{
 			Offset:             0,
 			Length:             2 * blockSize,
@@ -312,7 +312,7 @@ func TestNormalizeMappingsSingleMapping(t *testing.T) {
 		},
 	}
 
-	m := NormalizeMappings(input)
+	m := NormalizeMappings(t.Context(),input)
 
 	assert.Len(t, m, 1)
 	assert.Equal(t, uint64(0), m[0].Offset)
@@ -329,7 +329,7 @@ func TestNormalizeMappingsNoAdjacentSameBuildId(t *testing.T) {
 	id2 := uuid.New()
 	id3 := uuid.New()
 
-	input := []*BuildMap{
+	input := []BuildMap{
 		{
 			Offset:             0,
 			Length:             2 * blockSize,
@@ -350,7 +350,7 @@ func TestNormalizeMappingsNoAdjacentSameBuildId(t *testing.T) {
 		},
 	}
 
-	m := NormalizeMappings(input)
+	m := NormalizeMappings(t.Context(),input)
 
 	assert.Len(t, m, 3)
 	assert.Equal(t, id1, m[0].BuildId)
@@ -363,7 +363,7 @@ func TestNormalizeMappingsNoAdjacentSameBuildId(t *testing.T) {
 
 func TestNormalizeMappingsTwoAdjacentSameBuildId(t *testing.T) {
 	t.Parallel()
-	input := []*BuildMap{
+	input := []BuildMap{
 		{
 			Offset:             0,
 			Length:             2 * blockSize,
@@ -378,7 +378,7 @@ func TestNormalizeMappingsTwoAdjacentSameBuildId(t *testing.T) {
 		},
 	}
 
-	m := NormalizeMappings(input)
+	m := NormalizeMappings(t.Context(),input)
 
 	assert.Len(t, m, 1)
 	assert.Equal(t, uint64(0), m[0].Offset)
@@ -392,7 +392,7 @@ func TestNormalizeMappingsTwoAdjacentSameBuildId(t *testing.T) {
 
 func TestNormalizeMappingsAllSameBuildId(t *testing.T) {
 	t.Parallel()
-	input := []*BuildMap{
+	input := []BuildMap{
 		{
 			Offset:             0,
 			Length:             2 * blockSize,
@@ -419,7 +419,7 @@ func TestNormalizeMappingsAllSameBuildId(t *testing.T) {
 		},
 	}
 
-	m := NormalizeMappings(input)
+	m := NormalizeMappings(t.Context(),input)
 
 	assert.Len(t, m, 1)
 	assert.Equal(t, uint64(0), m[0].Offset)
@@ -436,7 +436,7 @@ func TestNormalizeMappingsMultipleGroupsSameBuildId(t *testing.T) {
 	id1 := uuid.New()
 	id2 := uuid.New()
 
-	input := []*BuildMap{
+	input := []BuildMap{
 		{
 			Offset:             0,
 			Length:             2 * blockSize,
@@ -463,7 +463,7 @@ func TestNormalizeMappingsMultipleGroupsSameBuildId(t *testing.T) {
 		},
 	}
 
-	m := NormalizeMappings(input)
+	m := NormalizeMappings(t.Context(),input)
 
 	assert.Len(t, m, 2)
 	assert.Equal(t, uint64(0), m[0].Offset)
@@ -482,7 +482,7 @@ func TestNormalizeMappingsAlternatingBuildIds(t *testing.T) {
 	id1 := uuid.New()
 	id2 := uuid.New()
 
-	input := []*BuildMap{
+	input := []BuildMap{
 		{
 			Offset:             0,
 			Length:             2 * blockSize,
@@ -509,7 +509,7 @@ func TestNormalizeMappingsAlternatingBuildIds(t *testing.T) {
 		},
 	}
 
-	m := NormalizeMappings(input)
+	m := NormalizeMappings(t.Context(),input)
 
 	// Should not merge any mappings since no adjacent ones have the same BuildId
 	assert.Len(t, m, 4)
@@ -524,7 +524,7 @@ func TestNormalizeMappingsAlternatingBuildIds(t *testing.T) {
 
 func TestNormalizeMappingsThreeConsecutiveSameBuildId(t *testing.T) {
 	t.Parallel()
-	input := []*BuildMap{
+	input := []BuildMap{
 		{
 			Offset:             0,
 			Length:             2 * blockSize,
@@ -545,7 +545,7 @@ func TestNormalizeMappingsThreeConsecutiveSameBuildId(t *testing.T) {
 		},
 	}
 
-	m := NormalizeMappings(input)
+	m := NormalizeMappings(t.Context(),input)
 
 	assert.Len(t, m, 1)
 	assert.Equal(t, uint64(0), m[0].Offset)
@@ -563,7 +563,7 @@ func TestNormalizeMappingsMixedPattern(t *testing.T) {
 	id2 := uuid.New()
 	id3 := uuid.New()
 
-	input := []*BuildMap{
+	input := []BuildMap{
 		{
 			Offset:             0,
 			Length:             1 * blockSize,
@@ -602,7 +602,7 @@ func TestNormalizeMappingsMixedPattern(t *testing.T) {
 		},
 	}
 
-	m := NormalizeMappings(input)
+	m := NormalizeMappings(t.Context(),input)
 
 	assert.Len(t, m, 3)
 	// First two merged
@@ -624,7 +624,7 @@ func TestNormalizeMappingsMixedPattern(t *testing.T) {
 
 func TestNormalizeMappingsZeroLengthMapping(t *testing.T) {
 	t.Parallel()
-	input := []*BuildMap{
+	input := []BuildMap{
 		{
 			Offset:             0,
 			Length:             2 * blockSize,
@@ -645,7 +645,7 @@ func TestNormalizeMappingsZeroLengthMapping(t *testing.T) {
 		},
 	}
 
-	m := NormalizeMappings(input)
+	m := NormalizeMappings(t.Context(),input)
 
 	// All should be merged since they all have the same BuildId
 	assert.Len(t, m, 1)
@@ -659,7 +659,7 @@ func TestNormalizeMappingsZeroLengthMapping(t *testing.T) {
 
 func TestNormalizeMappingsDoesNotModifyInput(t *testing.T) {
 	t.Parallel()
-	input := []*BuildMap{
+	input := []BuildMap{
 		{
 			Offset:             0,
 			Length:             2 * blockSize,
@@ -687,7 +687,7 @@ func TestNormalizeMappingsDoesNotModifyInput(t *testing.T) {
 	originalOffset1 := input[1].Offset
 	originalLength1 := input[1].Length
 
-	m := NormalizeMappings(input)
+	m := NormalizeMappings(t.Context(),input)
 
 	// Verify result is correct
 	assert.Len(t, m, 2)

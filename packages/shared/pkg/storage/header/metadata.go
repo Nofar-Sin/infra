@@ -27,7 +27,7 @@ type DiffMetadata struct {
 func (d *DiffMetadata) toDiffMapping(
 	ctx context.Context,
 	buildID uuid.UUID,
-) (mapping []*BuildMap) {
+) (mapping []BuildMap) {
 	dirtyMappings := CreateMapping(
 		&buildID,
 		d.Dirty,
@@ -43,7 +43,8 @@ func (d *DiffMetadata) toDiffMapping(
 	)
 	telemetry.ReportEvent(ctx, "created empty mapping")
 
-	mappings := MergeMappings(dirtyMappings, emptyMappings)
+	var mappings []BuildMap
+	mappings = MergeMappings(dirtyMappings, emptyMappings)
 	telemetry.ReportEvent(ctx, "merge mappings")
 
 	return mappings
@@ -72,7 +73,7 @@ func (d *DiffMetadata) ToDiffHeader(
 	telemetry.ReportEvent(ctx, "merged mappings")
 
 	// TODO: We can run normalization only when empty mappings are not empty for this snapshot
-	m = NormalizeMappings(m)
+	m = NormalizeMappings(ctx, m)
 	telemetry.ReportEvent(ctx, "normalized mappings")
 
 	metadata := originalHeader.Metadata.NextGeneration(buildID)
