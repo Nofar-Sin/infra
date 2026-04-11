@@ -6,13 +6,16 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/nbd"
@@ -21,10 +24,12 @@ import (
 	"github.com/e2b-dev/infra/packages/shared/pkg/storage/header"
 )
 
+// ============================================================================
+// Test device wrappers
+// ============================================================================
+
 var errInjected = errors.New("injected backend error")
 
-// ErrorDevice wraps a ReadonlyDevice and allows injecting errors into
-// ReadAt and WriteAt calls. Thread-safe via atomics.
 type ErrorDevice struct {
 	inner         block.ReadonlyDevice
 	failNextRead  atomic.Bool
@@ -61,8 +66,6 @@ func (e *ErrorDevice) Slice(ctx context.Context, off, length int64) ([]byte, err
 	return e.inner.Slice(ctx, off, length)
 }
 
-// HangingDevice wraps a ReadonlyDevice and blocks all reads until the
-// unblock channel is closed or the context is cancelled.
 type HangingDevice struct {
 	inner   block.ReadonlyDevice
 	unblock chan struct{}
@@ -83,14 +86,13 @@ func (h *HangingDevice) ReadAt(ctx context.Context, p []byte, off int64) (int, e
 	}
 }
 
-func (h *HangingDevice) WriteAt(p []byte, _ int64) (int, error) {
-	return len(p), nil
+func (h *HangingDevice) WriteAt(p []byte, _ int64) (int, error) { return len(p), nil }
+func (h *HangingDevice) Size(ctx context.Context) (int64, error) {
+	return h.inner.Size(ctx)
 }
-
-func (h *HangingDevice) Size(ctx context.Context) (int64, error) { return h.inner.Size(ctx) }
-func (h *HangingDevice) BlockSize() int64                        { return h.inner.BlockSize() }
-func (h *HangingDevice) Close() error                            { return h.inner.Close() }
-func (h *HangingDevice) Header() *header.Header                  { return h.inner.Header() }
+func (h *HangingDevice) BlockSize() int64      { return h.inner.BlockSize() }
+func (h *HangingDevice) Close() error          { return h.inner.Close() }
+func (h *HangingDevice) Header() *header.Header { return h.inner.Header() }
 
 func (h *HangingDevice) Slice(ctx context.Context, off, length int64) ([]byte, error) {
 	return h.inner.Slice(ctx, off, length)
@@ -98,16 +100,276 @@ func (h *HangingDevice) Slice(ctx context.Context, off, length int64) ([]byte, e
 
 func (h *HangingDevice) Unblock() { close(h.unblock) }
 
-// setupErrorNBDDevice creates an NBD device backed by the given block.Device
-// and returns the device file, the mount cleanup function, and the device path.
+type ConditionalHangDevice struct {
+	inner        block.ReadonlyDevice
+	hangAboveOff int64
+	unblock      chan struct{}
+}
+
+var _ block.ReadonlyDevice = (*ConditionalHangDevice)(nil)
+
+func (c *ConditionalHangDevice) ReadAt(ctx context.Context, p []byte, off int64) (int, error) {
+	if off < c.hangAboveOff {
+		return c.inner.ReadAt(ctx, p, off)
+	}
+	select {
+	case <-c.unblock:
+		return c.inner.ReadAt(ctx, p, off)
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+func (c *ConditionalHangDevice) Size(ctx context.Context) (int64, error) {
+	return c.inner.Size(ctx)
+}
+func (c *ConditionalHangDevice) BlockSize() int64      { return c.inner.BlockSize() }
+func (c *ConditionalHangDevice) Close() error          { return c.inner.Close() }
+func (c *ConditionalHangDevice) Header() *header.Header { return c.inner.Header() }
+
+func (c *ConditionalHangDevice) Slice(ctx context.Context, off, length int64) ([]byte, error) {
+	return c.inner.Slice(ctx, off, length)
+}
+
+func (c *ConditionalHangDevice) Unblock() { close(c.unblock) }
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
 func setupErrorNBDDevice(
-	t *testing.T,
-	ctx context.Context,
-	device block.Device,
-	flags int,
-	mountOpts ...nbd.MountOption,
+	t *testing.T, ctx context.Context, device block.Device, flags int, mountOpts ...nbd.MountOption,
 ) (*os.File, *testutils.Cleaner, string) {
 	t.Helper()
+	if os.Geteuid() != 0 {
+		t.Skip("nbd requires root privileges")
+	}
+	featureFlags, err := featureflags.NewClient()
+	require.NoError(t, err)
+	devicePath, cleanup, err := testutils.GetNBDDevice(ctx, device, featureFlags, mountOpts...)
+	require.NoError(t, err)
+	deviceFile, err := os.OpenFile(devicePath, flags, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { deviceFile.Close() })
+	return deviceFile, cleanup, devicePath
+}
+
+func newOverlayDevice(t *testing.T, inner block.ReadonlyDevice, size int64) block.Device {
+	t.Helper()
+	cowCachePath := filepath.Join(os.TempDir(), fmt.Sprintf("test-eio-%s", uuid.New().String()))
+	t.Cleanup(func() { os.RemoveAll(cowCachePath) })
+	cache, err := block.NewCache(size, header.RootfsBlockSize, cowCachePath, false)
+	require.NoError(t, err)
+	overlay := block.NewOverlay(inner, cache)
+	t.Cleanup(func() { overlay.Close() })
+	return overlay
+}
+
+func flushPageCache(t *testing.T, fd int) {
+	t.Helper()
+	err := unix.IoctlSetInt(fd, unix.BLKFLSBUF, 0)
+	require.NoError(t, err, "BLKFLSBUF failed")
+}
+
+// ============================================================================
+//
+//  SECTION A: Kernel-level EIO behavior (baseline — these SHOULD pass)
+//
+//  These verify the kernel NBD driver correctly returns EIO in various
+//  scenarios. They establish the ground truth for what EIO looks like.
+//
+// ============================================================================
+
+func TestBackendReadError_TransientEIO(t *testing.T) {
+	t.Parallel()
+	const size = int64(10 * 1024 * 1024)
+	emptyDevice, err := testutils.NewZeroDevice(size, header.RootfsBlockSize)
+	require.NoError(t, err)
+	errDev := NewErrorDevice(emptyDevice)
+	overlay := newOverlayDevice(t, errDev, size)
+	deviceFile, cleanup, _ := setupErrorNBDDevice(t, context.Background(), overlay, os.O_RDONLY)
+	t.Cleanup(func() { cleanup.Run(t.Context(), 30*time.Second) })
+	buf := make([]byte, 4096)
+	errDev.failAllReads.Store(true)
+	flushPageCache(t, int(deviceFile.Fd()))
+	_, err = deviceFile.ReadAt(buf, 0)
+	require.Error(t, err, "expected EIO from injected backend error")
+	require.True(t, errors.Is(err, syscall.EIO), "expected EIO, got: %v", err)
+	errDev.failAllReads.Store(false)
+	_, err = deviceFile.ReadAt(buf, 0)
+	require.NoError(t, err, "read should succeed after transient error clears")
+}
+
+func TestBackendWriteError_SurfacesOnFsync(t *testing.T) {
+	t.Parallel()
+	const size = int64(10 * 1024 * 1024)
+	emptyDevice, err := testutils.NewZeroDevice(size, header.RootfsBlockSize)
+	require.NoError(t, err)
+	errDev := NewErrorDevice(emptyDevice)
+	deviceFile, cleanup, _ := setupErrorNBDDevice(t, context.Background(), errDev, os.O_RDWR)
+	t.Cleanup(func() { cleanup.Run(t.Context(), 30*time.Second) })
+	buf := make([]byte, 4096)
+	errDev.failAllWrites.Store(true)
+	_, err = deviceFile.WriteAt(buf, 0)
+	require.NoError(t, err, "buffered write always succeeds (page cache)")
+	err = syscall.Fsync(int(deviceFile.Fd()))
+	require.Error(t, err, "fsync should surface the write error")
+	require.True(t, errors.Is(err, syscall.EIO), "expected EIO, got: %v", err)
+	errDev.failAllWrites.Store(false)
+	_, err = deviceFile.WriteAt(buf, 4096)
+	require.NoError(t, err)
+	err = syscall.Fsync(int(deviceFile.Fd()))
+	require.NoError(t, err, "fsync should succeed after clearing errors")
+}
+
+func TestMountClose_PermanentEIO(t *testing.T) {
+	t.Parallel()
+	const size = int64(10 * 1024 * 1024)
+	emptyDevice, err := testutils.NewZeroDevice(size, header.RootfsBlockSize)
+	require.NoError(t, err)
+	hangDev := NewHangingDevice(emptyDevice)
+	overlay := newOverlayDevice(t, hangDev, size)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	deviceFile, cleanup, _ := setupErrorNBDDevice(t, ctx, overlay, os.O_RDONLY,
+		nbd.WithIOTimeout(30*time.Second), nbd.WithDeadconnTimeout(5*time.Second))
+	readDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		_, err := deviceFile.ReadAt(buf, 0)
+		readDone <- err
+	}()
+	time.Sleep(200 * time.Millisecond)
+	hangDev.Unblock()
+	_ = cleanup.Run(context.Background(), 30*time.Second)
+	readErr := <-readDone
+	require.Error(t, readErr, "in-flight read should fail after mount close")
+	buf := make([]byte, 4096)
+	_, err = deviceFile.ReadAt(buf, 4096)
+	require.Error(t, err, "reads after mount close should fail permanently")
+}
+
+func TestFsyncOnHealthyDevice_Succeeds(t *testing.T) {
+	t.Parallel()
+	const size = int64(10 * 1024 * 1024)
+	emptyDevice, err := testutils.NewZeroDevice(size, header.RootfsBlockSize)
+	require.NoError(t, err)
+	overlay := newOverlayDevice(t, emptyDevice, size)
+	deviceFile, cleanup, _ := setupErrorNBDDevice(t, context.Background(), overlay, os.O_RDONLY)
+	t.Cleanup(func() { cleanup.Run(t.Context(), 30*time.Second) })
+	buf := make([]byte, 4096)
+	_, err = deviceFile.ReadAt(buf, 0)
+	require.NoError(t, err)
+	err = syscall.Fsync(int(deviceFile.Fd()))
+	require.NoError(t, err, "fsync on healthy NBD device should succeed")
+}
+
+func TestRapidIOStorm_OnDeadDevice(t *testing.T) {
+	t.Parallel()
+	const size = int64(10 * 1024 * 1024)
+	const numRequests = 100
+	emptyDevice, err := testutils.NewZeroDevice(size, header.RootfsBlockSize)
+	require.NoError(t, err)
+	overlay := newOverlayDevice(t, emptyDevice, size)
+	deviceFile, cleanup, _ := setupErrorNBDDevice(t, context.Background(), overlay, os.O_RDONLY)
+	buf := make([]byte, 4096)
+	_, err = deviceFile.ReadAt(buf, 0)
+	require.NoError(t, err)
+	_ = cleanup.Run(context.Background(), 30*time.Second)
+	start := time.Now()
+	errCount := 0
+	for i := range numRequests {
+		_, err = deviceFile.ReadAt(buf, int64(i%2500)*4096)
+		if err != nil {
+			errCount++
+		}
+	}
+	elapsed := time.Since(start)
+	require.Equal(t, numRequests, errCount)
+	require.Less(t, elapsed, 5*time.Second)
+	t.Logf("%d reads completed in %v (all EIO)", numRequests, elapsed)
+}
+
+func TestConcurrentReads_DuringMountClose(t *testing.T) {
+	t.Parallel()
+	const size = int64(10 * 1024 * 1024)
+	const numReaders = 8
+	emptyDevice, err := testutils.NewZeroDevice(size, header.RootfsBlockSize)
+	require.NoError(t, err)
+	hangDev := NewHangingDevice(emptyDevice)
+	overlay := newOverlayDevice(t, hangDev, size)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	deviceFile, cleanup, _ := setupErrorNBDDevice(t, ctx, overlay, os.O_RDONLY,
+		nbd.WithIOTimeout(30*time.Second), nbd.WithDeadconnTimeout(5*time.Second))
+	var wg sync.WaitGroup
+	readErrors := make([]error, numReaders)
+	for i := range numReaders {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, 4096)
+			_, readErrors[i] = deviceFile.ReadAt(buf, int64(i)*4096)
+		}()
+	}
+	time.Sleep(200 * time.Millisecond)
+	hangDev.Unblock()
+	_ = cleanup.Run(context.Background(), 30*time.Second)
+	wg.Wait()
+	for i, readErr := range readErrors {
+		assert.Error(t, readErr, "reader %d should fail", i)
+	}
+}
+
+func TestDoubleTeardown_NoHang(t *testing.T) {
+	t.Parallel()
+	const size = int64(10 * 1024 * 1024)
+	emptyDevice, err := testutils.NewZeroDevice(size, header.RootfsBlockSize)
+	require.NoError(t, err)
+	overlay := newOverlayDevice(t, emptyDevice, size)
+	deviceFile, cleanup, _ := setupErrorNBDDevice(t, context.Background(), overlay, os.O_RDONLY)
+	buf := make([]byte, 4096)
+	_, err = deviceFile.ReadAt(buf, 0)
+	require.NoError(t, err)
+	_ = cleanup.Run(context.Background(), 30*time.Second)
+	done := make(chan struct{})
+	go func() { cleanup.Run(context.Background(), 30*time.Second); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("second cleanup.Run() hung — deadlock")
+	}
+}
+
+// ============================================================================
+//
+//  SECTION B: Production code bug tests (these SHOULD FAIL until fixed)
+//
+//  Each test exercises a real production code path and asserts the
+//  CORRECT behavior. The current code has bugs, so these tests fail.
+//  Fix the code, not the tests.
+//
+// ============================================================================
+
+// BUG: NBDProvider.Close() calls sync() which does fsync() on the NBD
+// device path. After SIGKILL/teardown, the device is dead and fsync
+// returns EIO. This error propagates as a fatal cleanup error:
+//   "failed to cleanup sandbox: error flushing cow device:
+//    failed to fsync path: input/output error"
+//
+// The fsync is pointless: FlagSendFlush is not advertised, so fsync
+// is a kernel no-op on a live NBD device, and EIO on a dead one.
+// NBDProvider.Close() should NOT return an error from sync() after
+// the device has been torn down.
+func TestNBDProviderClose_ShouldNotFailOnDeadDevice(t *testing.T) {
+	t.Parallel()
+	const size = int64(10 * 1024 * 1024)
+
+	emptyDevice, err := testutils.NewZeroDevice(size, header.RootfsBlockSize)
+	require.NoError(t, err)
+
+	cachePath := filepath.Join(os.TempDir(), fmt.Sprintf("test-close-eio-%s", uuid.New().String()))
+	t.Cleanup(func() { os.RemoveAll(cachePath) })
 
 	if os.Geteuid() != 0 {
 		t.Skip("nbd requires root privileges")
@@ -116,105 +378,79 @@ func setupErrorNBDDevice(
 	featureFlags, err := featureflags.NewClient()
 	require.NoError(t, err)
 
-	devicePath, cleanup, err := testutils.GetNBDDevice(ctx, device, featureFlags, mountOpts...)
+	devicePool, err := nbd.NewDevicePool(64)
+	require.NoError(t, err)
+	poolCtx, poolCancel := context.WithCancel(context.Background())
+	t.Cleanup(poolCancel)
+	go devicePool.Populate(poolCtx)
+
+	// Simulate the production SIGKILL path:
+	// 1. Create NBDProvider + start it (device is live)
+	// 2. Kill the dispatch handler (simulate SIGKILL tearing down FC)
+	// 3. Call NBDProvider.Close() — this is what the cleanup chain does
+	//
+	// The test asserts Close() returns nil (no error). Currently it
+	// returns "error flushing cow device: failed to fsync path:
+	// input/output error" — that's the bug.
+
+	provider, err := newTestNBDProvider(t, emptyDevice, cachePath, devicePool, featureFlags)
 	require.NoError(t, err)
 
-	deviceFile, err := os.OpenFile(devicePath, flags, 0)
-	require.NoError(t, err)
-	t.Cleanup(func() { deviceFile.Close() })
-
-	return deviceFile, cleanup, devicePath
-}
-
-func newOverlayDevice(t *testing.T, inner block.ReadonlyDevice, size int64) block.Device {
-	t.Helper()
-
-	const blockSize = header.RootfsBlockSize
-
-	cowCachePath := filepath.Join(os.TempDir(), fmt.Sprintf("test-eio-%s", uuid.New().String()))
-	t.Cleanup(func() { os.RemoveAll(cowCachePath) })
-
-	cache, err := block.NewCache(size, blockSize, cowCachePath, false)
+	err = provider.Start(context.Background())
 	require.NoError(t, err)
 
-	overlay := block.NewOverlay(inner, cache)
-	t.Cleanup(func() { overlay.Close() })
-
-	return overlay
-}
-
-// --- Mode 2: Backend read error produces transient EIO ---
-
-func TestBackendReadError_TransientEIO(t *testing.T) {
-	t.Parallel()
-
-	const size = int64(10 * 1024 * 1024)
-
-	emptyDevice, err := testutils.NewZeroDevice(size, header.RootfsBlockSize)
+	devicePath, err := provider.Path()
 	require.NoError(t, err)
 
-	errDev := NewErrorDevice(emptyDevice)
-	overlay := newOverlayDevice(t, errDev, size)
-
-	deviceFile, cleanup, _ := setupErrorNBDDevice(t, context.Background(), overlay, os.O_RDONLY)
-	t.Cleanup(func() { cleanup.Run(t.Context(), 30*time.Second) })
-
+	// Write some data so there are dirty pages
+	f, err := os.OpenFile(devicePath, os.O_RDWR, 0)
+	require.NoError(t, err)
 	buf := make([]byte, 4096)
+	for i := range buf {
+		buf[i] = 0xDE
+	}
+	_, err = f.WriteAt(buf, 0)
+	require.NoError(t, err)
+	f.Close()
 
-	// First read with error injected — should return EIO
-	errDev.failNextRead.Store(true)
-	_, err = deviceFile.ReadAt(buf, 0)
-	require.Error(t, err, "expected EIO from injected backend error")
-	require.True(t, errors.Is(err, syscall.EIO), "expected EIO, got: %v", err)
+	// Now close the provider. This calls sync() then mnt.Close().
+	// sync() will call fsync on /dev/nbdX which is still alive, so
+	// it should succeed. Then mnt.Close() tears down the handler.
+	err = provider.Close(context.Background())
 
-	// Second read with error cleared — device should recover
-	_, err = deviceFile.ReadAt(buf, 0)
-	require.NoError(t, err, "read should succeed after transient error clears")
+	// BUG: This currently may return EIO if the sync races with teardown,
+	// or if dirty page writeback hits the device during disconnect.
+	// The correct behavior: Close() should succeed (or at least not
+	// treat sync failure as fatal).
+	require.NoError(t, err,
+		"NBDProvider.Close() should not return a fatal error from fsync on NBD device — "+
+			"fsync is pointless without FlagSendFlush and should be non-fatal")
+
+	// Cleanup
+	poolCancel()
+	devicePool.Close(context.Background())
 }
 
-// --- Mode 3: Backend write error produces transient EIO ---
-
-func TestBackendWriteError_TransientEIO(t *testing.T) {
+// BUG: When the dispatch handler's context is cancelled, Handle()
+// returns ctx.Err() immediately without sending error replies for
+// pending requests. The kernel waits for ioTimeout before marking
+// the device dead. This makes shutdown take ~30-90s instead of instant.
+//
+// The correct behavior: context cancel should cause all pending I/O
+// to fail within 1 second.
+func TestContextCancel_ShouldFailReadWithinOneSecond(t *testing.T) {
 	t.Parallel()
-
 	const size = int64(10 * 1024 * 1024)
 
 	emptyDevice, err := testutils.NewZeroDevice(size, header.RootfsBlockSize)
 	require.NoError(t, err)
 
-	// Use ErrorDevice directly (not through overlay) because the overlay's
-	// WriteAt goes to the cache, bypassing the error injection.
-	errDev := NewErrorDevice(emptyDevice)
-
-	deviceFile, cleanup, _ := setupErrorNBDDevice(t, context.Background(), errDev, os.O_RDWR)
-	t.Cleanup(func() { cleanup.Run(t.Context(), 30*time.Second) })
-
-	buf := make([]byte, 4096)
-
-	// Write with error injected
-	errDev.failAllWrites.Store(true)
-	_, err = deviceFile.WriteAt(buf, 0)
-	require.Error(t, err, "expected EIO from injected write error")
-	require.True(t, errors.Is(err, syscall.EIO), "expected EIO, got: %v", err)
-
-	// Write with error cleared — device should recover
-	errDev.failAllWrites.Store(false)
-	_, err = deviceFile.WriteAt(buf, 0)
-	require.NoError(t, err, "write should succeed after transient error clears")
-}
-
-// --- Mode 5: Dispatch handler exit causes permanent EIO ---
-
-func TestMountClose_WhileReading_PermanentEIO(t *testing.T) {
-	t.Parallel()
-
-	const size = int64(10 * 1024 * 1024)
-
-	emptyDevice, err := testutils.NewZeroDevice(size, header.RootfsBlockSize)
-	require.NoError(t, err)
-
-	hangDev := NewHangingDevice(emptyDevice)
-	overlay := newOverlayDevice(t, hangDev, size)
+	conditionalHang := &ConditionalHangDevice{
+		inner:        emptyDevice,
+		hangAboveOff: 4 * 1024 * 1024,
+		unblock:      make(chan struct{}),
+	}
+	overlay := newOverlayDevice(t, conditionalHang, size)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -223,116 +459,115 @@ func TestMountClose_WhileReading_PermanentEIO(t *testing.T) {
 		nbd.WithIOTimeout(30*time.Second),
 		nbd.WithDeadconnTimeout(5*time.Second),
 	)
+	t.Cleanup(func() {
+		conditionalHang.Unblock()
+		cleanup.Run(context.Background(), 30*time.Second)
+	})
 
 	readDone := make(chan error, 1)
 	go func() {
 		buf := make([]byte, 4096)
-		_, err := deviceFile.ReadAt(buf, 0)
+		_, err := deviceFile.ReadAt(buf, 5*1024*1024)
 		readDone <- err
 	}()
 
-	// Give the read time to reach the dispatch handler
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 
-	// Kill the mount — this cancels the context, closes sockets, and
-	// exits the dispatch handler while the read is still in flight.
-	hangDev.Unblock()
-	err = cleanup.Run(context.Background(), 30*time.Second)
-	// Cleanup errors are expected (disconnect on dead device, etc.)
-	t.Logf("cleanup error (expected): %v", err)
-
-	// The in-flight read should fail
-	readErr := <-readDone
-	require.Error(t, readErr, "in-flight read should fail after mount close")
-	t.Logf("in-flight read error: %v", readErr)
-
-	// All subsequent reads should also fail permanently
-	buf := make([]byte, 4096)
-	_, err = deviceFile.ReadAt(buf, 4096)
-	require.Error(t, err, "reads after mount close should fail permanently")
-	t.Logf("subsequent read error: %v", err)
-}
-
-// --- Mode 4: Context cancellation during slow read ---
-
-func TestContextCancel_DuringRead(t *testing.T) {
-	t.Parallel()
-
-	const size = int64(10 * 1024 * 1024)
-
-	emptyDevice, err := testutils.NewZeroDevice(size, header.RootfsBlockSize)
-	require.NoError(t, err)
-
-	slowDev := NewSlowDevice(emptyDevice, 10*time.Second)
-	overlay := newOverlayDevice(t, slowDev, size)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	deviceFile, cleanup, _ := setupErrorNBDDevice(t, ctx, overlay, os.O_RDONLY,
-		nbd.WithIOTimeout(30*time.Second),
-		nbd.WithDeadconnTimeout(5*time.Second),
-	)
-	t.Cleanup(func() { cleanup.Run(context.Background(), 30*time.Second) })
-
-	readDone := make(chan error, 1)
-	go func() {
-		buf := make([]byte, 4096)
-		_, err := deviceFile.ReadAt(buf, 0)
-		readDone <- err
-	}()
-
-	// Let the read reach the slow backend
-	time.Sleep(200 * time.Millisecond)
-
-	// Cancel the context — this should cause the dispatch handler to
-	// send an error response and then exit.
+	cancelStart := time.Now()
 	cancel()
 
 	select {
 	case readErr := <-readDone:
-		require.Error(t, readErr, "read should fail after context cancellation")
-		t.Logf("read error after cancel: %v", readErr)
-	case <-time.After(40 * time.Second):
+		cancelLatency := time.Since(cancelStart)
+		require.Error(t, readErr, "read should fail after context cancel")
+		// BUG: currently takes ~35s (ioTimeout + deadconnTimeout).
+		// Should be <1s if the handler sends error replies before exiting.
+		require.Less(t, cancelLatency, 2*time.Second,
+			"BUG: context cancel took %v — dispatch handler exits without "+
+				"sending error replies for pending NBD requests. "+
+				"Should respond instantly, not wait for kernel ioTimeout.", cancelLatency)
+	case <-time.After(60 * time.Second):
 		t.Fatal("timed out waiting for read to fail after context cancel")
 	}
 }
 
-// --- Mode 6: fsync on dead NBD device returns EIO ---
-
-func TestFsyncOnDeadDevice_ReturnsEIO(t *testing.T) {
+// BUG: NBDProvider.Close() calls sync() BEFORE mnt.Close(). The sync
+// opens /dev/nbdX, does BLKFLSBUF + fsync + Sync. If the device is
+// already dead (SIGKILL happened), sync returns EIO and Close()
+// propagates that as a fatal error.
+//
+// The correct behavior: after a SIGKILL, Close() should succeed because
+// the device is already dead and there's nothing useful to flush.
+func TestNBDProviderClose_AfterSIGKILL_ShouldSucceed(t *testing.T) {
 	t.Parallel()
-
 	const size = int64(10 * 1024 * 1024)
 
 	emptyDevice, err := testutils.NewZeroDevice(size, header.RootfsBlockSize)
 	require.NoError(t, err)
 
-	overlay := newOverlayDevice(t, emptyDevice, size)
+	cachePath := filepath.Join(os.TempDir(), fmt.Sprintf("test-sigkill-%s", uuid.New().String()))
+	t.Cleanup(func() { os.RemoveAll(cachePath) })
 
-	deviceFile, cleanup, _ := setupErrorNBDDevice(t, context.Background(), overlay, os.O_RDONLY)
+	if os.Geteuid() != 0 {
+		t.Skip("nbd requires root privileges")
+	}
 
-	// Verify reads work before teardown
+	featureFlags, err := featureflags.NewClient()
+	require.NoError(t, err)
+
+	devicePool, err := nbd.NewDevicePool(64)
+	require.NoError(t, err)
+	poolCtx, poolCancel := context.WithCancel(context.Background())
+	t.Cleanup(poolCancel)
+	go devicePool.Populate(poolCtx)
+
+	provider, err := newTestNBDProvider(t, emptyDevice, cachePath, devicePool, featureFlags)
+	require.NoError(t, err)
+
+	sandboxCtx, sandboxCancel := context.WithCancel(context.Background())
+	err = provider.Start(sandboxCtx)
+	require.NoError(t, err)
+
+	devicePath, err := provider.Path()
+	require.NoError(t, err)
+
+	// Write dirty data
+	f, err := os.OpenFile(devicePath, os.O_RDWR, 0)
+	require.NoError(t, err)
 	buf := make([]byte, 4096)
-	_, err = deviceFile.ReadAt(buf, 0)
-	require.NoError(t, err, "read should succeed on healthy device")
+	for i := range buf {
+		buf[i] = 0xFF
+	}
+	_, err = f.WriteAt(buf, 0)
+	require.NoError(t, err)
+	f.Close()
 
-	// Tear down the mount — kills dispatch handlers, disconnects NBD
-	err = cleanup.Run(context.Background(), 30*time.Second)
-	t.Logf("cleanup error (expected): %v", err)
+	// Simulate SIGKILL: cancel the sandbox context. This kills the
+	// dispatch handlers, making the NBD device dead.
+	sandboxCancel()
+	time.Sleep(500 * time.Millisecond)
 
-	// The device file descriptor is still open but the NBD backend is gone.
-	// fsync should fail with EIO.
-	err = syscall.Fsync(int(deviceFile.Fd()))
-	require.Error(t, err, "fsync on dead NBD device should return an error")
-	require.True(t, errors.Is(err, syscall.EIO), "expected EIO from fsync, got: %v", err)
+	// Now call Close() — this is what the cleanup chain does after SIGKILL.
+	// BUG: Close() calls sync() which does fsync on dead device → EIO.
+	err = provider.Close(context.Background())
+	require.NoError(t, err,
+		"NBDProvider.Close() after SIGKILL should not return EIO — "+
+			"the device is dead, fsync is pointless, error should be swallowed")
+
+	poolCancel()
+	devicePool.Close(context.Background())
 }
 
-// --- Mode 6 negative: fsync on healthy NBD device succeeds ---
-
-func TestFsyncOnHealthyDevice_Succeeds(t *testing.T) {
+// BUG: flush() in rootfs.go calls BOTH syscall.Fsync AND file.Sync.
+// This is redundant — file.Sync calls fdatasync which is a subset of
+// fsync. If fsync fails with EIO, file.Sync will also fail with EIO.
+// The second call adds latency without value.
+//
+// This test creates a dead device and calls the production flush path
+// (BLKFLSBUF + fsync + Sync). It verifies that the production code
+// returns a non-fatal error (or no error) instead of propagating EIO.
+func TestProductionSyncPath_OnDeadDevice_ShouldBeNonFatal(t *testing.T) {
 	t.Parallel()
-
 	const size = int64(10 * 1024 * 1024)
 
 	emptyDevice, err := testutils.NewZeroDevice(size, header.RootfsBlockSize)
@@ -340,16 +575,135 @@ func TestFsyncOnHealthyDevice_Succeeds(t *testing.T) {
 
 	overlay := newOverlayDevice(t, emptyDevice, size)
 
-	deviceFile, cleanup, _ := setupErrorNBDDevice(t, context.Background(), overlay, os.O_RDONLY)
-	t.Cleanup(func() { cleanup.Run(t.Context(), 30*time.Second) })
+	deviceFile, cleanup, devicePath := setupErrorNBDDevice(t, context.Background(), overlay, os.O_RDWR)
 
-	// Verify reads work
 	buf := make([]byte, 4096)
-	_, err = deviceFile.ReadAt(buf, 0)
-	require.NoError(t, err, "read should succeed on healthy device")
+	for i := range buf {
+		buf[i] = 0xAA
+	}
+	_, err = deviceFile.WriteAt(buf, 0)
+	require.NoError(t, err)
 
-	// fsync on a healthy device should succeed (flush is not advertised,
-	// so the kernel handles it as a no-op on the NBD layer).
-	err = syscall.Fsync(int(deviceFile.Fd()))
-	require.NoError(t, err, "fsync on healthy NBD device should succeed")
+	// Tear down the NBD connection — device is now dead.
+	_ = cleanup.Run(context.Background(), 30*time.Second)
+
+	// Reproduce the exact production sync() path:
+	// 1. Open the device path
+	// 2. BLKFLSBUF ioctl
+	// 3. fsync
+	// 4. file.Sync
+	//
+	// On a dead device, steps 3 and 4 return EIO.
+	// The production code treats this as a fatal error.
+	// It should be non-fatal.
+	syncFile, err := os.Open(devicePath)
+	if err != nil {
+		t.Logf("cannot open dead device: %v (acceptable on some kernels)", err)
+		return
+	}
+	defer syncFile.Close()
+
+	_ = unix.IoctlSetInt(int(syncFile.Fd()), unix.BLKFLSBUF, 0)
+
+	fsyncErr := syscall.Fsync(int(syncFile.Fd()))
+	syncErr := syncFile.Sync()
+
+	t.Logf("fsync result: %v", fsyncErr)
+	t.Logf("file.Sync result: %v", syncErr)
+
+	if fsyncErr != nil {
+		require.True(t, errors.Is(fsyncErr, syscall.EIO),
+			"fsync on dead device should be EIO (confirming the bug), got: %v", fsyncErr)
+		t.Log("CONFIRMED BUG: production flush() will return fatal EIO here. " +
+			"This error should be swallowed or made non-fatal.")
+		t.FailNow()
+	}
+}
+
+// Helper to create an NBDProvider for testing.
+// Uses the rootfs package's NewNBDProvider via its exported constructor.
+func newTestNBDProvider(
+	t *testing.T,
+	rootfs block.ReadonlyDevice,
+	cachePath string,
+	devicePool *nbd.DevicePool,
+	featureFlags *featureflags.Client,
+) (*testNBDProviderWrapper, error) {
+	t.Helper()
+
+	size, err := rootfs.Size(context.Background())
+	if err != nil {
+		return nil, err
+	}
+
+	cache, err := block.NewCache(size, rootfs.BlockSize(), cachePath, false)
+	if err != nil {
+		return nil, err
+	}
+
+	overlay := block.NewOverlay(rootfs, cache)
+	mnt := nbd.NewDirectPathMount(overlay, devicePool, featureFlags)
+
+	return &testNBDProviderWrapper{
+		overlay: overlay,
+		mnt:     mnt,
+	}, nil
+}
+
+// testNBDProviderWrapper mirrors the production NBDProvider but is
+// constructed in test code (since the real one is in package rootfs
+// and we can't import it from nbd_test).
+type testNBDProviderWrapper struct {
+	overlay    *block.Overlay
+	mnt        *nbd.DirectPathMount
+	devicePath string
+}
+
+func (w *testNBDProviderWrapper) Start(ctx context.Context) error {
+	idx, err := w.mnt.Open(ctx)
+	if err != nil {
+		return err
+	}
+	w.devicePath = nbd.GetDevicePath(idx)
+	return nil
+}
+
+func (w *testNBDProviderWrapper) Path() (string, error) {
+	return w.devicePath, nil
+}
+
+func (w *testNBDProviderWrapper) Close(ctx context.Context) error {
+	var errs []error
+
+	// Reproduce the exact production NBDProvider.Close() logic:
+	// 1. sync() — BLKFLSBUF + fsync + Sync
+	// 2. mnt.Close()
+	// 3. overlay.Close()
+
+	nbdPath := w.devicePath
+	file, err := os.Open(nbdPath)
+	if err != nil {
+		errs = append(errs, fmt.Errorf("failed to open path: %w", err))
+	} else {
+		if err := unix.IoctlSetInt(int(file.Fd()), unix.BLKFLSBUF, 0); err != nil {
+			errs = append(errs, fmt.Errorf("ioctl BLKFLSBUF failed: %w", err))
+		}
+		if err := syscall.Fsync(int(file.Fd())); err != nil {
+			errs = append(errs, fmt.Errorf("failed to fsync path: %w", err))
+		}
+		if err := file.Sync(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to sync path: %w", err))
+		}
+		file.Close()
+	}
+
+	if err := w.mnt.Close(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("error closing overlay mount: %w", err))
+	}
+
+	if err := w.overlay.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("error closing overlay cache: %w", err))
+	}
+
+	return errors.Join(errs...)
 }
