@@ -131,12 +131,15 @@ func (o *NBDProvider) Close(ctx context.Context) error {
 
 	var errs []error
 
-	err := o.sync(ctx)
-	if err != nil {
-		errs = append(errs, fmt.Errorf("error flushing cow device: %w", err))
+	// sync() does BLKFLSBUF + fsync on the NBD device. This is a no-op on
+	// a live device (FlagSendFlush is not advertised) and returns EIO on a
+	// dead device (after SIGKILL). Neither outcome affects data safety — the
+	// overlay cache (mmap file) is the persistence layer. Log and continue.
+	if err := o.sync(ctx); err != nil {
+		logger.L().Warn(ctx, "sync on NBD device failed (expected after SIGKILL)", zap.Error(err))
 	}
 
-	err = o.mnt.Close(ctx)
+	err := o.mnt.Close(ctx)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("error closing overlay mount: %w", err))
 	}

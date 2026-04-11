@@ -152,8 +152,6 @@ func (d *Dispatch) Handle(ctx context.Context) error {
 				break // Try again when we have more data...
 			}
 
-			// We can read the neader...
-
 			header := buffer[rp : rp+28]
 			request.Magic = binary.BigEndian.Uint32(header)
 			request.Type = binary.BigEndian.Uint32(header[4:8])
@@ -169,7 +167,13 @@ func (d *Dispatch) Handle(ctx context.Context) error {
 			case NBDCmdDisconnect:
 				return nil // All done
 			case NBDCmdFlush:
-				return fmt.Errorf("not supported: Flush")
+				// FlagSendFlush is not advertised, so the kernel should
+				// never send this. Handle defensively as a no-op success
+				// instead of killing the dispatch handler.
+				rp += 28
+				if err := d.writeResponse(0, request.Handle, []byte{}); err != nil {
+					return err
+				}
 			case NBDCmdRead:
 				rp += 28
 				err := d.cmdRead(ctx, request.Handle, request.From, request.Length)

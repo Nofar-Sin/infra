@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"syscall"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -24,7 +23,9 @@ type Provider interface {
 	ExportDiff(ctx context.Context, out *os.File, closeSandbox func(context.Context) error) (*header.DiffMetadata, error)
 }
 
-// flush flushes the data to the operating system's buffer.
+// flush flushes dirty pages for the given block device path.
+// Uses file.Sync() (fdatasync) which is sufficient for block devices —
+// metadata sync (fsync) adds no value for NBD devices without FlagSendFlush.
 func flush(ctx context.Context, path string) error {
 	ctx, span := tracer.Start(ctx, "flush", trace.WithAttributes(attribute.String("path", path)))
 	defer span.End()
@@ -40,13 +41,7 @@ func flush(ctx context.Context, path string) error {
 		}
 	}()
 
-	err = syscall.Fsync(int(file.Fd()))
-	if err != nil {
-		return fmt.Errorf("failed to fsync path: %w", err)
-	}
-
-	err = file.Sync()
-	if err != nil {
+	if err := file.Sync(); err != nil {
 		return fmt.Errorf("failed to sync path: %w", err)
 	}
 
