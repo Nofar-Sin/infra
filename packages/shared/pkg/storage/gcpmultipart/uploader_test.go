@@ -1,4 +1,4 @@
-package storage
+package gcpmultipart
 
 import (
 	"encoding/xml"
@@ -31,32 +31,33 @@ const (
 	uploadsPath    = "uploads"
 )
 
-// createTestMultipartUploader creates a test uploader with a mock HTTP client
-func createTestMultipartUploader(t *testing.T, handler http.HandlerFunc, retryConfig ...RetryConfig) *MultipartUploader {
+// createTestUploader creates a test uploader with a mock HTTP client
+var defaultTestRetry = RetryConfig{
+	MaxAttempts:       10,
+	InitialBackoff:    10 * time.Millisecond,
+	MaxBackoff:        10 * time.Second,
+	BackoffMultiplier: 2,
+}
+
+func createTestUploader(t *testing.T, handler http.HandlerFunc, retryConfig ...RetryConfig) *Uploader {
 	t.Helper()
 
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 
-	config := DefaultRetryConfig()
+	config := defaultTestRetry
 	if len(retryConfig) > 0 {
 		config = retryConfig[0]
 	}
 
-	// Create retryable client using the test server's client
-	retryableClient := createRetryableClient(t.Context(), config)
+	retryableClient := newRetryClient(t.Context(), config)
 	retryableClient.HTTPClient = server.Client()
 
-	uploader := &MultipartUploader{
-		bucketName:  testBucketName,
-		objectName:  testObjectName,
-		token:       testToken,
-		client:      retryableClient,
-		retryConfig: config,
-		baseURL:     server.URL, // Override to use test server
+	return &Uploader{
+		token:   testToken,
+		client:  retryableClient,
+		baseURL: server.URL + "/" + testObjectName,
 	}
-
-	return uploader
 }
 
 func TestMultipartUploader_InitiateUpload_Success(t *testing.T) {
@@ -70,9 +71,7 @@ func TestMultipartUploader_InitiateUpload_Success(t *testing.T) {
 		assert.Equal(t, "Bearer "+testToken, r.Header.Get("Authorization"))
 		assert.Equal(t, "application/octet-stream", r.Header.Get("Content-Type"))
 
-		response := InitiateMultipartUploadResult{
-			Bucket:   testBucketName,
-			Key:      testObjectName,
+		response := xmlInitiateResponse{
 			UploadID: expectedUploadID,
 		}
 
@@ -82,8 +81,8 @@ func TestMultipartUploader_InitiateUpload_Success(t *testing.T) {
 		w.Write(xmlData)
 	})
 
-	uploader := createTestMultipartUploader(t, handler)
-	uploadID, err := uploader.initiateUpload(t.Context())
+	uploader := createTestUploader(t, handler)
+	uploadID, err := uploader.initiate(t.Context())
 
 	require.NoError(t, err)
 	require.Equal(t, expectedUploadID, uploadID)
@@ -108,8 +107,8 @@ func TestMultipartUploader_UploadPart_Success(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	uploader := createTestMultipartUploader(t, handler)
-	etag, err := uploader.uploadPart(t.Context(), "test-upload-id", 1, testData)
+	uploader := createTestUploader(t, handler)
+	etag, err := uploader.putPart(t.Context(), "test-upload-id", 1, testData)
 
 	require.NoError(t, err)
 	require.Equal(t, expectedETag, etag)
@@ -122,17 +121,17 @@ func TestMultipartUploader_UploadPart_MissingETag(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	uploader := createTestMultipartUploader(t, handler)
-	etag, err := uploader.uploadPart(t.Context(), "test-upload-id", 1, []byte("test"))
+	uploader := createTestUploader(t, handler)
+	etag, err := uploader.putPart(t.Context(), "test-upload-id", 1, []byte("test"))
 
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "no ETag returned for part 1")
+	require.Contains(t, err.Error(), "no ETag for part 1")
 	require.Empty(t, etag)
 }
 
 func TestMultipartUploader_CompleteUpload_Success(t *testing.T) {
 	t.Parallel()
-	parts := []Part{
+	parts := []xmlPart{
 		{PartNumber: 1, ETag: `"etag1"`},
 		{PartNumber: 2, ETag: `"etag2"`},
 	}
@@ -146,7 +145,7 @@ func TestMultipartUploader_CompleteUpload_Success(t *testing.T) {
 		body, err := io.ReadAll(r.Body)
 		assert.NoError(t, err)
 
-		var completeReq CompleteMultipartUpload
+		var completeReq xmlCompleteRequest
 		err = xml.Unmarshal(body, &completeReq)
 		assert.NoError(t, err)
 		assert.Len(t, completeReq.Parts, 2)
@@ -156,9 +155,18 @@ func TestMultipartUploader_CompleteUpload_Success(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	uploader := createTestMultipartUploader(t, handler)
-	err := uploader.completeUpload(t.Context(), "test-upload-id", parts)
+	uploader := createTestUploader(t, handler)
+	err := uploader.complete(t.Context(), "test-upload-id", parts)
 	require.NoError(t, err)
+}
+
+func readTestFile(t *testing.T, path string) []byte {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	return data
 }
 
 func TestMultipartUploader_UploadFileInParallel_Success(t *testing.T) {
@@ -171,7 +179,7 @@ func TestMultipartUploader_UploadFileInParallel_Success(t *testing.T) {
 	require.NoError(t, err)
 
 	var uploadID string
-	var initiateCount, uploadPartCount, completeCount int32
+	var initiateCount, putPartCount, completeCount int32
 	receivedParts := sync.Map{}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -180,9 +188,7 @@ func TestMultipartUploader_UploadFileInParallel_Success(t *testing.T) {
 			// Initiate upload
 			atomic.AddInt32(&initiateCount, 1)
 			uploadID = "test-upload-id-123"
-			response := InitiateMultipartUploadResult{
-				Bucket:   testBucketName,
-				Key:      testObjectName,
+			response := xmlInitiateResponse{
 				UploadID: uploadID,
 			}
 			xmlData, _ := xml.Marshal(response)
@@ -192,7 +198,7 @@ func TestMultipartUploader_UploadFileInParallel_Success(t *testing.T) {
 
 		case strings.Contains(r.URL.RawQuery, "partNumber"):
 			// Upload part
-			partNum := atomic.AddInt32(&uploadPartCount, 1)
+			partNum := atomic.AddInt32(&putPartCount, 1)
 			body, _ := io.ReadAll(r.Body)
 			receivedParts.Store(int(partNum), string(body))
 
@@ -206,17 +212,17 @@ func TestMultipartUploader_UploadFileInParallel_Success(t *testing.T) {
 		}
 	})
 
-	uploader := createTestMultipartUploader(t, handler)
-	_, err = uploader.UploadFileInParallel(t.Context(), testFile, 2)
+	uploader := createTestUploader(t, handler)
+	_, err = uploader.Upload(t.Context(), readTestFile(t, testFile), 2)
 	require.NoError(t, err)
 
 	require.Equal(t, int32(1), atomic.LoadInt32(&initiateCount))
 	require.Equal(t, int32(1), atomic.LoadInt32(&completeCount))
-	require.Positive(t, atomic.LoadInt32(&uploadPartCount))
+	require.Positive(t, atomic.LoadInt32(&putPartCount))
 
 	// Verify all parts were uploaded and content matches
 	var reconstructed strings.Builder
-	for i := 1; i <= int(atomic.LoadInt32(&uploadPartCount)); i++ {
+	for i := 1; i <= int(atomic.LoadInt32(&putPartCount)); i++ {
 		if part, ok := receivedParts.Load(i); ok {
 			reconstructed.WriteString(part.(string))
 		}
@@ -237,9 +243,7 @@ func TestMultipartUploader_InitiateUpload_WithRetries(t *testing.T) {
 			return
 		}
 
-		response := InitiateMultipartUploadResult{
-			Bucket:   testBucketName,
-			Key:      testObjectName,
+		response := xmlInitiateResponse{
 			UploadID: expectedUploadID,
 		}
 		xmlData, _ := xml.Marshal(response)
@@ -254,8 +258,8 @@ func TestMultipartUploader_InitiateUpload_WithRetries(t *testing.T) {
 		BackoffMultiplier: 2,
 	}
 
-	uploader := createTestMultipartUploader(t, handler, config)
-	uploadID, err := uploader.initiateUpload(t.Context())
+	uploader := createTestUploader(t, handler, config)
+	uploadID, err := uploader.initiate(t.Context())
 
 	require.NoError(t, err)
 	require.Equal(t, expectedUploadID, uploadID)
@@ -282,9 +286,7 @@ func TestMultipartUploader_HighConcurrency_StressTest(t *testing.T) {
 		switch {
 		case r.URL.RawQuery == uploadsPath:
 			atomic.AddInt32(&initiateCalls, 1)
-			response := InitiateMultipartUploadResult{
-				Bucket:   testBucketName,
-				Key:      testObjectName,
+			response := xmlInitiateResponse{
 				UploadID: "stress-test-upload-id",
 			}
 			xmlData, _ := xml.Marshal(response)
@@ -320,10 +322,10 @@ func TestMultipartUploader_HighConcurrency_StressTest(t *testing.T) {
 		}
 	})
 
-	uploader := createTestMultipartUploader(t, handler)
+	uploader := createTestUploader(t, handler)
 
 	// Use high concurrency to stress test
-	_, err = uploader.UploadFileInParallel(t.Context(), testFile, 50)
+	_, err = uploader.Upload(t.Context(), readTestFile(t, testFile), 50)
 	require.NoError(t, err)
 
 	// Verify all calls were made
@@ -356,9 +358,7 @@ func TestMultipartUploader_RandomFailures_ChaosTest(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.RawQuery == uploadsPath:
-			response := InitiateMultipartUploadResult{
-				Bucket:   testBucketName,
-				Key:      testObjectName,
+			response := xmlInitiateResponse{
 				UploadID: "chaos-upload-id",
 			}
 			xmlData, _ := xml.Marshal(response)
@@ -393,8 +393,8 @@ func TestMultipartUploader_RandomFailures_ChaosTest(t *testing.T) {
 		BackoffMultiplier: 2,
 	}
 
-	uploader := createTestMultipartUploader(t, handler, config)
-	_, err = uploader.UploadFileInParallel(t.Context(), testFile, 10)
+	uploader := createTestUploader(t, handler, config)
+	_, err = uploader.Upload(t.Context(), readTestFile(t, testFile), 10)
 	require.NoError(t, err)
 
 	t.Logf("Chaos test: %d total attempts, %d successes",
@@ -418,9 +418,7 @@ func TestMultipartUploader_PartialFailures_Recovery(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.RawQuery == uploadsPath:
-			response := InitiateMultipartUploadResult{
-				Bucket:   testBucketName,
-				Key:      testObjectName,
+			response := xmlInitiateResponse{
 				UploadID: "partial-fail-upload-id",
 			}
 			xmlData, _ := xml.Marshal(response)
@@ -458,8 +456,8 @@ func TestMultipartUploader_PartialFailures_Recovery(t *testing.T) {
 		BackoffMultiplier: 2,
 	}
 
-	uploader := createTestMultipartUploader(t, handler, config)
-	_, err = uploader.UploadFileInParallel(t.Context(), testFile, 5)
+	uploader := createTestUploader(t, handler, config)
+	_, err = uploader.Upload(t.Context(), readTestFile(t, testFile), 5)
 	require.NoError(t, err)
 
 	// Verify that all parts eventually succeeded after retries
@@ -484,9 +482,7 @@ func TestMultipartUploader_EdgeCases_EmptyFile(t *testing.T) {
 		switch {
 		case r.URL.RawQuery == uploadsPath:
 			atomic.AddInt32(&initiateCalls, 1)
-			response := InitiateMultipartUploadResult{
-				Bucket:   testBucketName,
-				Key:      testObjectName,
+			response := xmlInitiateResponse{
 				UploadID: "empty-file-upload-id",
 			}
 			xmlData, _ := xml.Marshal(response)
@@ -507,8 +503,8 @@ func TestMultipartUploader_EdgeCases_EmptyFile(t *testing.T) {
 		}
 	})
 
-	uploader := createTestMultipartUploader(t, handler)
-	_, err = uploader.UploadFileInParallel(t.Context(), emptyFile, 5)
+	uploader := createTestUploader(t, handler)
+	_, err = uploader.Upload(t.Context(), readTestFile(t, emptyFile), 5)
 	require.NoError(t, err)
 
 	require.Equal(t, int32(1), atomic.LoadInt32(&initiateCalls))
@@ -529,9 +525,7 @@ func TestMultipartUploader_EdgeCases_VerySmallFile(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.RawQuery == uploadsPath:
-			response := InitiateMultipartUploadResult{
-				Bucket:   testBucketName,
-				Key:      testObjectName,
+			response := xmlInitiateResponse{
 				UploadID: "small-file-upload-id",
 			}
 			xmlData, _ := xml.Marshal(response)
@@ -550,8 +544,8 @@ func TestMultipartUploader_EdgeCases_VerySmallFile(t *testing.T) {
 		}
 	})
 
-	uploader := createTestMultipartUploader(t, handler)
-	_, err = uploader.UploadFileInParallel(t.Context(), smallFile, 10) // High concurrency for small file
+	uploader := createTestUploader(t, handler)
+	_, err = uploader.Upload(t.Context(), readTestFile(t, smallFile), 10)
 	require.NoError(t, err)
 	require.Equal(t, smallContent, receivedData)
 }
@@ -590,9 +584,9 @@ func TestMultipartUploader_ResourceExhaustion_TooManyConcurrentUploads(t *testin
 	testFile := filepath.Join(tempDir, "resource.txt")
 	file, err := os.Create(testFile)
 	require.NoError(t, err)
-	count, err := io.Copy(file, newRepeatReader('a', gcpMultipartUploadChunkSize*totalChunks))
+	count, err := io.Copy(file, newRepeatReader('a', ChunkSize*totalChunks))
 	require.NoError(t, err)
-	assert.GreaterOrEqual(t, count, int64(gcpMultipartUploadChunkSize*totalChunks))
+	assert.GreaterOrEqual(t, count, int64(ChunkSize*totalChunks))
 	err = file.Close()
 	require.NoError(t, err)
 
@@ -602,9 +596,7 @@ func TestMultipartUploader_ResourceExhaustion_TooManyConcurrentUploads(t *testin
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.RawQuery == uploadsPath:
-			response := InitiateMultipartUploadResult{
-				Bucket:   testBucketName,
-				Key:      testObjectName,
+			response := xmlInitiateResponse{
 				UploadID: "resource-test-upload-id",
 			}
 			xmlData, _ := xml.Marshal(response)
@@ -635,10 +627,10 @@ func TestMultipartUploader_ResourceExhaustion_TooManyConcurrentUploads(t *testin
 		}
 	})
 
-	uploader := createTestMultipartUploader(t, handler)
+	uploader := createTestUploader(t, handler)
 
 	// Try with extremely high concurrency
-	_, err = uploader.UploadFileInParallel(t.Context(), testFile, 1000)
+	_, err = uploader.Upload(t.Context(), readTestFile(t, testFile), 1000)
 	require.NoError(t, err)
 
 	// Should have observed significant concurrency but not necessarily 1000
@@ -652,7 +644,7 @@ func TestMultipartUploader_BoundaryConditions_ExactChunkSize(t *testing.T) {
 	tempDir := t.TempDir()
 	testFile := filepath.Join(tempDir, "exact.txt")
 	// Create file that's exactly 2 chunks
-	testContent := strings.Repeat("x", gcpMultipartUploadChunkSize*2)
+	testContent := strings.Repeat("x", ChunkSize*2)
 	err := os.WriteFile(testFile, []byte(testContent), 0o644)
 	require.NoError(t, err)
 
@@ -662,9 +654,7 @@ func TestMultipartUploader_BoundaryConditions_ExactChunkSize(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.RawQuery == uploadsPath:
-			response := InitiateMultipartUploadResult{
-				Bucket:   testBucketName,
-				Key:      testObjectName,
+			response := xmlInitiateResponse{
 				UploadID: "boundary-upload-id",
 			}
 			xmlData, _ := xml.Marshal(response)
@@ -686,25 +676,14 @@ func TestMultipartUploader_BoundaryConditions_ExactChunkSize(t *testing.T) {
 		}
 	})
 
-	uploader := createTestMultipartUploader(t, handler)
-	_, err = uploader.UploadFileInParallel(t.Context(), testFile, 5)
+	uploader := createTestUploader(t, handler)
+	_, err = uploader.Upload(t.Context(), readTestFile(t, testFile), 5)
 	require.NoError(t, err)
 
 	// Should have exactly 2 parts, each of ChunkSize
 	require.Len(t, partSizes, 2)
-	require.Equal(t, gcpMultipartUploadChunkSize, partSizes[0])
-	require.Equal(t, gcpMultipartUploadChunkSize, partSizes[1])
-}
-
-func TestMultipartUploader_FileNotFound_Error(t *testing.T) {
-	t.Parallel()
-	uploader := createTestMultipartUploader(t, func(http.ResponseWriter, *http.Request) {
-		t.Error("Should not make any HTTP requests for missing file")
-	})
-
-	_, err := uploader.UploadFileInParallel(t.Context(), "/nonexistent/file.txt", 5)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "failed to open file")
+	require.Equal(t, ChunkSize, partSizes[0])
+	require.Equal(t, ChunkSize, partSizes[1])
 }
 
 func TestMultipartUploader_ConcurrentRetries_RaceCondition(t *testing.T) {
@@ -723,9 +702,7 @@ func TestMultipartUploader_ConcurrentRetries_RaceCondition(t *testing.T) {
 
 		switch {
 		case r.URL.RawQuery == uploadsPath:
-			response := InitiateMultipartUploadResult{
-				Bucket:   testBucketName,
-				Key:      testObjectName,
+			response := xmlInitiateResponse{
 				UploadID: "race-upload-id",
 			}
 			xmlData, _ := xml.Marshal(response)
@@ -764,8 +741,8 @@ func TestMultipartUploader_ConcurrentRetries_RaceCondition(t *testing.T) {
 		BackoffMultiplier: 2,
 	}
 
-	uploader := createTestMultipartUploader(t, handler, config)
-	_, err = uploader.UploadFileInParallel(t.Context(), testFile, 20) // High concurrency
+	uploader := createTestUploader(t, handler, config)
+	_, err = uploader.Upload(t.Context(), readTestFile(t, testFile), 20)
 	require.NoError(t, err)
 
 	t.Logf("Total HTTP requests made: %d", atomic.LoadInt32(&totalRequests))
@@ -789,7 +766,7 @@ func TestCreateRetryableClient_JitterBehavior(t *testing.T) {
 		BackoffMultiplier: 2.0,
 	}
 
-	client := createRetryableClient(t.Context(), config)
+	client := newRetryClient(t.Context(), config)
 	require.NotNil(t, client)
 	require.NotNil(t, client.Backoff)
 
@@ -876,7 +853,7 @@ func TestCreateRetryableClient_Configuration(t *testing.T) {
 		BackoffMultiplier: 3.0,
 	}
 
-	client := createRetryableClient(t.Context(), config)
+	client := newRetryClient(t.Context(), config)
 
 	// Verify retry configuration
 	require.Equal(t, config.MaxAttempts-1, client.RetryMax) // go-retryablehttp counts retries, not total attempts
@@ -896,7 +873,7 @@ func TestCreateRetryableClient_ZeroBackoff(t *testing.T) {
 		BackoffMultiplier: 2.0,
 	}
 
-	client := createRetryableClient(t.Context(), config)
+	client := newRetryClient(t.Context(), config)
 
 	// With zero initial backoff, jitter should also return zero
 	backoff := client.Backoff(config.InitialBackoff, config.MaxBackoff, 0, nil)
@@ -934,7 +911,7 @@ func TestRetryableClient_ActualRetryBehavior(t *testing.T) {
 		BackoffMultiplier: 2.0,
 	}
 
-	client := createRetryableClient(t.Context(), config)
+	client := newRetryClient(t.Context(), config)
 	client.HTTPClient = server.Client()
 
 	startTime := time.Now()
