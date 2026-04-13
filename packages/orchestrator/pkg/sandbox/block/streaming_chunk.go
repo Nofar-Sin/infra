@@ -460,7 +460,7 @@ func (c *StreamingChunker) Close() error {
 	return c.cache.Close()
 }
 
-func (c *StreamingChunker) Data() []byte {
+func (c *StreamingChunker) Data() ([]byte, func()) {
 	return c.cache.Data()
 }
 

@@ -150,13 +150,15 @@ func (b *StorageDiff) CachePath() (string, error) {
 	return b.cachePath, nil
 }
 
-func (b *StorageDiff) Data() []byte {
+func (b *StorageDiff) Data() ([]byte, func(), error) {
 	c, err := b.chunker.Wait()
 	if err != nil {
-		return nil
+		return nil, func() {}, err
 	}
 
-	return c.Data()
+	data, release := c.Data()
+
+	return data, release, nil
 }
 
 func (b *StorageDiff) FileSize() (int64, error) {

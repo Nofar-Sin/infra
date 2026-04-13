@@ -174,7 +174,12 @@ func (t *TemplateBuild) Upload(ctx context.Context, metadataPath string, fcSnapf
 	})
 
 	eg.Go(func() error {
-		data := rootfsDiff.Data()
+		data, release, err := rootfsDiff.Data()
+		if err != nil {
+			return fmt.Errorf("failed to get rootfs data: %w", err)
+		}
+		defer release()
+
 		if data == nil {
 			return nil
 		}
@@ -183,7 +188,12 @@ func (t *TemplateBuild) Upload(ctx context.Context, metadataPath string, fcSnapf
 	})
 
 	eg.Go(func() error {
-		data := memfileDiff.Data()
+		data, release, err := memfileDiff.Data()
+		if err != nil {
+			return fmt.Errorf("failed to get memfile data: %w", err)
+		}
+		defer release()
+
 		if data == nil {
 			return nil
 		}

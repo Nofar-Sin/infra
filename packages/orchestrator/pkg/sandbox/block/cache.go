@@ -410,15 +410,20 @@ func (c *Cache) Path() string {
 	return c.filePath
 }
 
-func (c *Cache) Data() []byte {
+func (c *Cache) Data() ([]byte, func()) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
 
 	if c.mmap == nil {
-		return nil
+		c.mu.RUnlock()
+
+		return nil, func() {}
 	}
 
-	return []byte(*c.mmap)
+	releaseCacheCloseLock := func() {
+		c.mu.RUnlock()
+	}
+
+	return []byte(*c.mmap), releaseCacheCloseLock
 }
 
 func NewCacheFromProcessMemory(
