@@ -92,7 +92,7 @@ func TestInstallCACert_FirstTime(t *testing.T) {
 	bundlePath, extraPath := testPaths(t)
 	c := newTestInstaller(t)
 
-	c.install(context.Background(), certA, bundlePath, extraPath)
+	require.NoError(t, c.install(context.Background(), certA, bundlePath, extraPath))
 	waitForFile(t, extraPath)
 
 	bundle, err := os.ReadFile(bundlePath)
@@ -109,8 +109,8 @@ func TestInstallCACert_SameCert(t *testing.T) {
 	bundlePath, extraPath := testPaths(t)
 	c := newTestInstaller(t)
 
-	c.install(context.Background(), certA, bundlePath, extraPath)
-	c.install(context.Background(), certA, bundlePath, extraPath) // resume — hot path hit
+	require.NoError(t, c.install(context.Background(), certA, bundlePath, extraPath))
+	require.NoError(t, c.install(context.Background(), certA, bundlePath, extraPath)) // resume — hot path hit
 
 	bundle, err := os.ReadFile(bundlePath)
 	require.NoError(t, err)
@@ -124,9 +124,9 @@ func TestInstallCACert_DifferentCert(t *testing.T) {
 	bundlePath, extraPath := testPaths(t)
 	c := newTestInstaller(t)
 
-	c.install(context.Background(), certA, bundlePath, extraPath)
+	require.NoError(t, c.install(context.Background(), certA, bundlePath, extraPath))
 
-	c.install(context.Background(), certB, bundlePath, extraPath)
+	require.NoError(t, c.install(context.Background(), certB, bundlePath, extraPath))
 
 	normalizedA := strings.TrimRight(certA, "\n") + "\n"
 	normalizedB := strings.TrimRight(certB, "\n") + "\n"
@@ -144,7 +144,7 @@ func TestInstallCACert_EmptyCert(t *testing.T) {
 	bundlePath, extraPath := testPaths(t)
 	c := newTestInstaller(t)
 
-	c.install(context.Background(), "", bundlePath, extraPath)
+	require.NoError(t, c.install(context.Background(), "", bundlePath, extraPath))
 
 	bundle, err := os.ReadFile(bundlePath)
 	require.NoError(t, err)
@@ -167,7 +167,7 @@ func TestInstallCACert_RestartSameCert(t *testing.T) {
 	// State of the VM after a previous envd run.
 	require.NoError(t, os.WriteFile(bundlePath, []byte(baseBundle+normalizedA), 0o644))
 
-	c.install(context.Background(), certA, bundlePath, extraPath)
+	require.NoError(t, c.install(context.Background(), certA, bundlePath, extraPath))
 	waitForFile(t, extraPath)
 
 	bundle, err := os.ReadFile(bundlePath)
@@ -191,7 +191,7 @@ func TestInstallCACert_RestartDifferentCert(t *testing.T) {
 	// State of the VM after a previous envd run that installed certA.
 	require.NoError(t, os.WriteFile(bundlePath, []byte(baseBundle+normalizedA), 0o644))
 
-	c.install(context.Background(), certB, bundlePath, extraPath)
+	require.NoError(t, c.install(context.Background(), certB, bundlePath, extraPath))
 	waitForFile(t, extraPath)
 
 	bundle, err := os.ReadFile(bundlePath)
@@ -208,17 +208,22 @@ func TestInstallCACert_ConcurrentResume(t *testing.T) {
 	bundlePath, extraPath := testPaths(t)
 	c := newTestInstaller(t)
 
-	c.install(context.Background(), certA, bundlePath, extraPath)
+	require.NoError(t, c.install(context.Background(), certA, bundlePath, extraPath))
 
 	var wg sync.WaitGroup
+	errCh := make(chan error, 10)
 
 	for range 10 {
 		wg.Go(func() {
-			c.install(context.Background(), certA, bundlePath, extraPath)
+			errCh <- c.install(context.Background(), certA, bundlePath, extraPath)
 		})
 	}
 
 	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		require.NoError(t, err)
+	}
 
 	// Acquire mu to drain any in-flight background goroutines.
 	c.mu.Lock()
