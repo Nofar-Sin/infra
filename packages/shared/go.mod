@@ -390,3 +390,5 @@ require (
 	k8s.io/klog/v2 v2.130.1 // indirect
 	k8s.io/utils v0.0.0-20250604170112-4c0f3b243397 // indirect
 )
+
+replace github.com/RoaringBitmap/roaring/v2 => github.com/e2b-dev/roaring/v2 v2.16.1-0.20260414023502-84f4d2a47de0
