@@ -415,8 +415,8 @@ github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+m
 github.com/dvyukov/go-fuzz v0.0.0-20210914135545-4980593459a1/go.mod h1:11Gm+ccJnvAhCNLlf5+cS9KjtbaD5I5zaZpFMsTHWTw=
 github.com/e2b-dev/go-nfs v0.0.0-20260318224420-f59b77ca8555 h1:cUImAB4xt5kewJV1cd0gJMspWgmuMgbpj3Q8qIOUWrY=
 github.com/e2b-dev/go-nfs v0.0.0-20260318224420-f59b77ca8555/go.mod h1:VhNccO67Oug787VNXcyx9JDI3ZoSpqoKMT/lWMhUIDg=
-github.com/e2b-dev/roaring/v2 v2.16.1-0.20260414023502-84f4d2a47de0 h1:oMousFYN9HcGhkGI3w5tLrPULU7emYvvTOFcoXrsdWQ=
-github.com/e2b-dev/roaring/v2 v2.16.1-0.20260414023502-84f4d2a47de0/go.mod h1:eq4wdNXxtJIS/oikeCzdX1rBzek7ANzbth041hrU8Q4=
+github.com/e2b-dev/roaring/v2 v2.16.1-0.20260414062913-60ea6a744802 h1:bRZYp9EWe9jIL+6HEvw1jSWB0LYnPkG45H8OTNrVgnw=
+github.com/e2b-dev/roaring/v2 v2.16.1-0.20260414062913-60ea6a744802/go.mod h1:eq4wdNXxtJIS/oikeCzdX1rBzek7ANzbth041hrU8Q4=
 github.com/ebitengine/purego v0.9.0 h1:mh0zpKBIXDceC63hpvPuGLiJ8ZAa3DfrFTudmfi8A4k=
 github.com/ebitengine/purego v0.9.0/go.mod h1:iIjxzd6CiRiOG0UyXP+V1+jWqUXVjPKLAI0mRfJZTmQ=
 github.com/edsrzf/mmap-go v1.2.0 h1:hXLYlkbaPzt1SaQk+anYwKSRNhufIDCchSPkUD6dD84=
