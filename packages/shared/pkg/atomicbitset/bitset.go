@@ -12,11 +12,8 @@ type Bitset struct {
 }
 
 func New() *Bitset {
-	bm := roaring.New()
-	bm.SetCopyOnWrite(true)
-
 	return &Bitset{
-		bm: bm,
+		bm: roaring.New(),
 	}
 }
 
