@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/bits-and-blooms/bitset"
+	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/edsrzf/mmap-go"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -117,7 +117,7 @@ func (c *Cache) ExportToDiff(ctx context.Context, out *os.File) (*header.DiffMet
 	}
 
 	if c.mmap == nil {
-		return header.NewDiffMetadata(c.blockSize, bitset.New(0)), nil
+		return header.NewDiffMetadata(c.blockSize, roaring.New()), nil
 	}
 
 	f, err := os.Open(c.filePath)
@@ -136,7 +136,7 @@ func (c *Cache) ExportToDiff(ctx context.Context, out *os.File) (*header.DiffMet
 		logger.L().Warn(ctx, "error syncing file", zap.Error(err))
 	}
 
-	diffMetadata := header.NewDiffMetadata(c.blockSize, c.dirty.BitSet())
+	diffMetadata := header.NewDiffMetadata(c.blockSize, c.dirty.Bitmap())
 
 	dst := int(out.Fd())
 	var writeOffset int64
@@ -194,7 +194,7 @@ func (c *Cache) ExportToDiff(ctx context.Context, out *os.File) (*header.DiffMet
 	telemetry.SetAttributes(ctx,
 		attribute.Int64("copy_ms", time.Since(copyStart).Milliseconds()),
 		attribute.Int64("total_size_bytes", c.size),
-		attribute.Int64("dirty_size_bytes", int64(diffMetadata.Dirty.Count())*c.blockSize),
+		attribute.Int64("dirty_size_bytes", int64(diffMetadata.Dirty.GetCardinality())*c.blockSize),
 		attribute.Int64("total_ranges", totalRanges),
 	)
 

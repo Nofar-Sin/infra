@@ -4,7 +4,7 @@ import (
 	"sync"
 	"testing"
 
-	roaring "github.com/RoaringBitmap/roaring/v2"
+	"github.com/RoaringBitmap/roaring/v2"
 	"github.com/stretchr/testify/require"
 )
 

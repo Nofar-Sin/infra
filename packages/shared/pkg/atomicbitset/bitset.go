@@ -3,8 +3,7 @@ package atomicbitset
 import (
 	"sync"
 
-	roaring "github.com/RoaringBitmap/roaring/v2"
-	"github.com/bits-and-blooms/bitset"
+	"github.com/RoaringBitmap/roaring/v2"
 )
 
 type Bitset struct {
@@ -13,8 +12,11 @@ type Bitset struct {
 }
 
 func New() *Bitset {
+	bm := roaring.New()
+	bm.SetCopyOnWrite(true)
+
 	return &Bitset{
-		bm: roaring.New(),
+		bm: bm,
 	}
 }
 
@@ -32,9 +34,9 @@ func (b *Bitset) SetRange(start, end uint64) {
 	b.bm.AddRange(start, end)
 }
 
-func (b *Bitset) BitSet() *bitset.BitSet {
+func (b *Bitset) Bitmap() *roaring.Bitmap {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
-	return b.bm.ToBitSet()
+	return b.bm.Clone()
 }

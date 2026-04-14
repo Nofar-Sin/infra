@@ -3,7 +3,7 @@ package uffd
 import (
 	"context"
 
-	"github.com/bits-and-blooms/bitset"
+	"github.com/RoaringBitmap/roaring/v2"
 
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/block"
 	"github.com/e2b-dev/infra/packages/orchestrator/pkg/sandbox/fc"
@@ -38,14 +38,14 @@ func (m *NoopMemory) DiffMetadata(ctx context.Context, f *fc.Process) (*header.D
 		return nil, err
 	}
 
-	dirty := diffInfo.Dirty.Difference(diffInfo.Empty)
+	dirty := roaring.AndNot(diffInfo.Dirty, diffInfo.Empty)
 
 	numberOfPages := header.TotalBlocks(m.size, m.blockSize)
 
-	empty := bitset.New(uint(numberOfPages))
-	empty.FlipRange(0, uint(numberOfPages))
+	allPages := roaring.New()
+	allPages.AddRange(0, uint64(numberOfPages))
 
-	empty = empty.Difference(dirty)
+	empty := roaring.AndNot(allPages, dirty)
 
 	return &header.DiffMetadata{
 		Dirty:     dirty,
