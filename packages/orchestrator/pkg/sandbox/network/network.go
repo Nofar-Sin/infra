@@ -201,21 +201,17 @@ func (s *Slot) CreateNetwork(ctx context.Context) error {
 		return fmt.Errorf("error adding route from host to FC: %w", err)
 	}
 
-	// Add host forwarding rules
-	err = tables.Append("filter", "FORWARD", "-i", s.VethName(), "-o", defaultGateway, "-j", "ACCEPT")
+	// Add host forwarding rules.
+	// No output interface constraint — routing table decides the egress path
+	// (direct default gateway or tunnel to egress gateway for live-migration support).
+	err = tables.Append("filter", "FORWARD", "-i", s.VethName(), "-j", "ACCEPT")
 	if err != nil {
-		return fmt.Errorf("error creating forwarding rule to default gateway: %w", err)
+		return fmt.Errorf("error creating forwarding rule from veth: %w", err)
 	}
 
-	err = tables.Append("filter", "FORWARD", "-i", defaultGateway, "-o", s.VethName(), "-j", "ACCEPT")
+	err = tables.Append("filter", "FORWARD", "-o", s.VethName(), "-j", "ACCEPT")
 	if err != nil {
-		return fmt.Errorf("error creating forwarding rule from default gateway: %w", err)
-	}
-
-	// Add host postrouting rules
-	err = tables.Append("nat", "POSTROUTING", "-s", s.HostCIDR(), "-o", defaultGateway, "-j", "MASQUERADE")
-	if err != nil {
-		return fmt.Errorf("error creating postrouting rule: %w", err)
+		return fmt.Errorf("error creating forwarding rule to veth: %w", err)
 	}
 
 	// Redirect traffic destined for hyperloop proxy
@@ -270,20 +266,14 @@ func (s *Slot) RemoveNetwork() error {
 		errs = append(errs, fmt.Errorf("error initializing iptables: %w", err))
 	} else {
 		// Delete host forwarding rules
-		err = tables.Delete("filter", "FORWARD", "-i", s.VethName(), "-o", defaultGateway, "-j", "ACCEPT")
+		err = tables.Delete("filter", "FORWARD", "-i", s.VethName(), "-j", "ACCEPT")
 		if err != nil {
-			errs = append(errs, fmt.Errorf("error deleting host forwarding rule to default gateway: %w", err))
+			errs = append(errs, fmt.Errorf("error deleting host forwarding rule from veth: %w", err))
 		}
 
-		err = tables.Delete("filter", "FORWARD", "-i", defaultGateway, "-o", s.VethName(), "-j", "ACCEPT")
+		err = tables.Delete("filter", "FORWARD", "-o", s.VethName(), "-j", "ACCEPT")
 		if err != nil {
-			errs = append(errs, fmt.Errorf("error deleting host forwarding rule from default gateway: %w", err))
-		}
-
-		// Delete host postrouting rules
-		err = tables.Delete("nat", "POSTROUTING", "-s", s.HostCIDR(), "-o", defaultGateway, "-j", "MASQUERADE")
-		if err != nil {
-			errs = append(errs, fmt.Errorf("error deleting host postrouting rule: %w", err))
+			errs = append(errs, fmt.Errorf("error deleting host forwarding rule to veth: %w", err))
 		}
 
 		// Delete hyperloop proxy redirect rule

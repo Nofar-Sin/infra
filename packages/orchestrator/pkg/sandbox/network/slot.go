@@ -83,7 +83,11 @@ type Slot struct {
 	config      Config
 }
 
-func NewSlot(key string, idx int, config Config, egressProxy EgressProxy) (*Slot, error) {
+// NewSlot creates a network slot. The hostIP parameter allows callers to
+// provide a stable HostIP for the sandbox (used during live migration / resume
+// so the sandbox keeps the same HostIP across nodes). Pass nil to derive the
+// HostIP from the slot index (default behavior for new sandboxes).
+func NewSlot(key string, idx int, config Config, egressProxy EgressProxy, hostIP net.IP) (*Slot, error) {
 	if idx < 1 || idx > vrtSlotsSize {
 		return nil, fmt.Errorf("slot index %d is out of range [1, %d)", idx, vrtSlotsSize)
 	}
@@ -104,9 +108,12 @@ func NewSlot(key string, idx int, config Config, egressProxy EgressProxy) (*Slot
 		return nil, fmt.Errorf("failed to parse vrt CIDR: %w", err)
 	}
 
-	hostIp, err := netutils.GetIndexedIP(hostNetworkCIDR, idx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get host IP: %w", err)
+	hostIp := hostIP
+	if hostIp == nil {
+		hostIp, err = netutils.GetIndexedIP(hostNetworkCIDR, idx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get host IP: %w", err)
+		}
 	}
 
 	hostCIDR := fmt.Sprintf("%s/%d", hostIp.String(), hostMask)

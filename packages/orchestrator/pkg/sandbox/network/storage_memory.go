@@ -36,7 +36,7 @@ func (s *StorageMemory) Acquire(_ context.Context) (*Slot, error) {
 		if !s.freeSlots[slotIdx] {
 			s.freeSlots[slotIdx] = true
 
-			return NewSlot(key, slotIdx, s.config, s.egressProxy)
+			return NewSlot(key, slotIdx, s.config, s.egressProxy, nil)
 		}
 	}
 

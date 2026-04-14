@@ -734,3 +734,57 @@ variable "ingress_timeout_seconds" {
   type    = number
   default = 80
 }
+
+# ---------- Sandbox egress gateway (live migration) ----------
+
+variable "sandbox_egress_gateway_enabled" {
+  description = "Enable the sandbox egress gateway pool for live migration support. When enabled, sandbox egress NAT is handled by gateway VMs + Cloud NAT instead of per-node MASQUERADE."
+  type        = bool
+  default     = false
+}
+
+variable "sandbox_egress_gateways" {
+  description = <<-EOT
+    Map of egress gateway instances. Keys are gateway names (e.g. "gw-1", "gw-2").
+    Set active=false to drain a gateway: orchestrators stop routing new traffic to
+    it, but it keeps running until existing conntrack entries expire. Once drained,
+    remove the key entirely to destroy the VM.
+
+    Example:
+      sandbox_egress_gateways = {
+        gw-1 = { active = true }
+        gw-2 = { active = true }
+        gw-3 = { active = false }  # draining
+      }
+  EOT
+  type = map(object({
+    active       = bool
+    machine_type = optional(string, "e2-small")
+    zone         = optional(string, "")
+  }))
+  default = {}
+}
+
+variable "sandbox_egress_ip_count" {
+  description = "Number of static external IPs to allocate for sandbox egress NAT pool."
+  type        = number
+  default     = 8
+}
+
+variable "sandbox_egress_gateway_subnet_cidr" {
+  description = "CIDR for the egress gateway's dedicated subnet."
+  type        = string
+  default     = "10.20.0.0/28"
+}
+
+variable "sandbox_egress_min_ports_per_vm" {
+  description = "Minimum ports per VM for sandbox egress Cloud NAT. Set high since gateway VMs handle all sandbox traffic."
+  type        = number
+  default     = 32768
+}
+
+variable "sandbox_host_network_cidr" {
+  description = "The sandbox host network CIDR (must match orchestrator SANDBOXES_HOST_NETWORK_CIDR env var)."
+  type        = string
+  default     = "10.11.0.0/16"
+}

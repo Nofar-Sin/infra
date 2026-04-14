@@ -99,7 +99,7 @@ func (s *StorageLocal) Acquire(ctx context.Context) (*Slot, error) {
 			s.acquiredNs[slotName] = struct{}{}
 			slotKey := getLocalKey(slotIdx)
 
-			return NewSlot(slotKey, slotIdx, s.config, s.egressProxy)
+			return NewSlot(slotKey, slotIdx, s.config, s.egressProxy, nil)
 		}
 	}
 }

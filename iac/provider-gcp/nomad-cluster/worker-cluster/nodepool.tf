@@ -28,6 +28,8 @@ locals {
     SET_ORCHESTRATOR_VERSION_METADATA = var.set_orchestrator_version_metadata ? "true" : "false"
     NODE_LABELS                       = join(",", var.node_labels)
     PERSISTENT_VOLUME_TYPES           = var.persistent_volume_types
+    EGRESS_GATEWAY_IPS                = var.egress_gateway_ips
+    SANDBOX_HOST_NETWORK_CIDR         = var.sandbox_host_network_cidr
   })
 }
 
@@ -153,6 +155,7 @@ resource "google_compute_instance_template" "template" {
   instance_description = null
   machine_type         = var.machine_type
   min_cpu_platform     = var.min_cpu_platform
+  can_ip_forward       = var.can_ip_forward
 
   labels = merge(
     var.labels,

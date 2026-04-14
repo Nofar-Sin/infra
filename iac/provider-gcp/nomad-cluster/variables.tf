@@ -382,3 +382,45 @@ variable "additional_api_paths_handled_by_ingress" {
 variable "ingress_timeout_seconds" {
   type = number
 }
+
+# ---------- Sandbox egress gateway (live migration) ----------
+
+variable "sandbox_egress_gateway_enabled" {
+  description = "Enable the sandbox egress gateway pool for live migration support."
+  type        = bool
+}
+
+variable "sandbox_egress_gateways" {
+  description = <<-EOT
+    Map of egress gateway instances. Each key is a gateway name.
+    - active: whether orchestrators should route NEW traffic through this gateway.
+      Set to false to drain (gateway keeps running for existing connections).
+    - machine_type: GCE machine type (e.g. "e2-small").
+    - zone: GCE zone override (empty string = use default gcp_zone).
+  EOT
+  type = map(object({
+    active       = bool
+    machine_type = optional(string, "e2-small")
+    zone         = optional(string, "")
+  }))
+}
+
+variable "sandbox_egress_ip_count" {
+  description = "Number of static external IPs to allocate for sandbox egress NAT."
+  type        = number
+}
+
+variable "sandbox_egress_gateway_subnet_cidr" {
+  description = "CIDR for the egress gateway's dedicated subnet."
+  type        = string
+}
+
+variable "sandbox_egress_min_ports_per_vm" {
+  description = "Minimum ports per VM for sandbox egress Cloud NAT."
+  type        = number
+}
+
+variable "sandbox_host_network_cidr" {
+  description = "The sandbox host network CIDR used for HostIP allocation (must match SANDBOXES_HOST_NETWORK_CIDR)."
+  type        = string
+}

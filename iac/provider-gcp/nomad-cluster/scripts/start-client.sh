@@ -143,6 +143,109 @@ udevadm trigger
 # Load the nbd module with 4096 devices
 modprobe nbd nbds_max=4096
 
+# ---------- Egress gateway tunnels for sandbox live migration ----------
+EGRESS_GW_IPS='${EGRESS_GATEWAY_IPS}'
+
+EGRESS_GW_COUNT=$(echo "$EGRESS_GW_IPS" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+
+if [ "$EGRESS_GW_COUNT" -gt 0 ]; then
+  echo "[Setting up IPIP tunnels to $EGRESS_GW_COUNT egress gateway(s)]"
+  modprobe ipip
+
+  # L4 consistent hashing: same (src IP, dst IP, src port, dst port) always
+  # picks the same gateway. Critical for connection stability across migration.
+  sysctl -w net.ipv4.fib_multipath_hash_policy=1
+
+  LOCAL_IP=$(curl -sf -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip)
+
+  # Create tunnels and nexthop objects
+  IDX=0
+  NH_GROUP=""
+  for GW_IP in $(echo "$EGRESS_GW_IPS" | python3 -c "import sys,json; [print(ip) for ip in json.load(sys.stdin)]"); do
+    TUNNEL="egress$IDX"
+    NH_ID=$((IDX + 1))
+
+    ip tunnel add "$TUNNEL" mode ipip remote "$GW_IP" local "$LOCAL_IP"
+    ip link set "$TUNNEL" up
+    ip link set "$TUNNEL" mtu 1480
+
+    ip nexthop add id $NH_ID dev "$TUNNEL"
+
+    [ -n "$NH_GROUP" ] && NH_GROUP="$NH_GROUP/"
+    NH_GROUP="$NH_GROUP$NH_ID"
+
+    echo "- Tunnel $TUNNEL -> $GW_IP (nexthop $NH_ID)"
+    IDX=$((IDX + 1))
+  done
+
+  # Nexthop group: kernel ECMP across all gateways.
+  # Route changes use "ip nexthop replace" which is atomic — no blackhole window.
+  ip nexthop add id 100 group $NH_GROUP
+  ip rule add from ${SANDBOX_HOST_NETWORK_CIDR} lookup 100 priority 100
+  ip route add default nhid 100 table 100
+
+  # Store config for the health checker
+  mkdir -p /etc/egress-gateway
+  echo "$EGRESS_GW_IPS" > /etc/egress-gateway/ips.json
+
+  # Health checker: pings each gateway every 5s, atomically updates the
+  # nexthop group membership. No state machine, no route flush, no blackhole.
+  cat > /usr/local/bin/egress-gw-healthcheck <<'HEALTHCHECK_EOF'
+#!/bin/bash
+set -uo pipefail
+
+GW_IPS=($(python3 -c "import json; [print(ip) for ip in json.load(open('/etc/egress-gateway/ips.json'))]"))
+PREV_GROUP=""
+
+while true; do
+  sleep 5
+  GROUP=""
+  for i in "${!GW_IPS[@]}"; do
+    NH_ID=$((i + 1))
+    TUNNEL="egress$i"
+    if ping -c 1 -W 2 -I "$TUNNEL" "${GW_IPS[$i]}" &>/dev/null; then
+      [ -n "$GROUP" ] && GROUP="$GROUP/"
+      GROUP="$GROUP$NH_ID"
+    fi
+  done
+
+  if [ -z "$GROUP" ]; then
+    logger -t egress-healthcheck "CRITICAL: no healthy egress gateways"
+    continue
+  fi
+
+  if [ "$GROUP" != "$PREV_GROUP" ]; then
+    ip nexthop replace id 100 group $GROUP 2>/dev/null
+    logger -t egress-healthcheck "nexthop group updated: $GROUP"
+    PREV_GROUP="$GROUP"
+  fi
+done
+HEALTHCHECK_EOF
+
+  chmod +x /usr/local/bin/egress-gw-healthcheck
+
+  cat > /etc/systemd/system/egress-gw-healthcheck.service <<'SYSTEMD_EOF'
+[Unit]
+Description=Egress gateway health checker
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/egress-gw-healthcheck
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+SYSTEMD_EOF
+
+  systemctl daemon-reload
+  systemctl enable --now egress-gw-healthcheck
+
+  echo "- Health checker started"
+  echo "- Policy routing for ${SANDBOX_HOST_NETWORK_CIDR} via nexthop group"
+fi
+
 # Create the directory for the fc mounts
 mkdir -p /fc-vm
 

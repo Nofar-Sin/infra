@@ -247,3 +247,21 @@ variable "persistent_volume_types" {
     nfs_mount_opts   = string
   }))
 }
+
+variable "can_ip_forward" {
+  description = "Allow instances to send/receive packets with non-matching source/destination IPs (needed for egress gateway tunneling)."
+  type        = bool
+  default     = false
+}
+
+variable "egress_gateway_ips" {
+  description = "JSON-encoded list of active egress gateway internal IPs. Tunnels and ECMP routes are created only to these."
+  type        = string
+  default     = "[]"
+}
+
+variable "sandbox_host_network_cidr" {
+  description = "Sandbox host network CIDR for policy routing to egress gateway."
+  type        = string
+  default     = "10.11.0.0/16"
+}

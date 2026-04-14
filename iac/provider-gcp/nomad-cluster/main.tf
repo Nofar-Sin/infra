@@ -251,6 +251,16 @@ module "client_cluster" {
   nfs_mount_opts          = local.nfs_mount_opts
   persistent_volume_types = var.persistent_volume_types
 
+  can_ip_forward            = var.sandbox_egress_gateway_enabled
+  sandbox_host_network_cidr = var.sandbox_host_network_cidr
+
+  # Only active gateway IPs (static, survive MIG auto-heal).
+  # Draining gateways are excluded from orchestrator routing.
+  egress_gateway_ips = jsonencode([
+    for k, v in google_compute_address.egress_gateway_internal : v.address
+    if var.sandbox_egress_gateways[k].active
+  ])
+
   environment = var.environment
   labels      = var.labels
 

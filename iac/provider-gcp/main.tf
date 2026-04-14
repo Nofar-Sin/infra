@@ -193,6 +193,14 @@ module "cluster" {
   server_boot_disk_size_gb  = var.server_boot_disk_size_gb
   clickhouse_boot_disk_type = var.clickhouse_boot_disk_type
   loki_boot_disk_type       = var.loki_boot_disk_type
+
+  # Sandbox egress gateway
+  sandbox_egress_gateway_enabled     = var.sandbox_egress_gateway_enabled
+  sandbox_egress_gateways            = var.sandbox_egress_gateways
+  sandbox_egress_ip_count            = var.sandbox_egress_ip_count
+  sandbox_egress_gateway_subnet_cidr = var.sandbox_egress_gateway_subnet_cidr
+  sandbox_egress_min_ports_per_vm    = var.sandbox_egress_min_ports_per_vm
+  sandbox_host_network_cidr          = var.sandbox_host_network_cidr
 }
 
 module "nomad" {
