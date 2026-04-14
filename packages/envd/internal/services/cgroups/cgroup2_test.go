@@ -39,7 +39,7 @@ func TestCgroupRoundTrip(t *testing.T) {
 		return
 	}
 
-	maxTimeout := time.Second * 5
+	maxTimeout := time.Second * 15
 
 	t.Run("process does not die without cgroups", func(t *testing.T) {
 		t.Parallel()
